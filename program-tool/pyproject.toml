@@ -1,0 +1,18 @@
+[project]
+name = "dap-flash-tool"
+version = "0.1.0"
+description = "A polished CMSIS-DAP flashing GUI powered by pyOCD."
+requires-python = ">=3.10"
+dependencies = [
+    "pyocd>=0.36",
+    "pyinstaller>=6.10",
+    "ttkbootstrap>=1.10",
+    "pyelftools>=0.30",
+]
+
+[project.scripts]
+dap-flash-tool = "dap_flash_tool.app:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
