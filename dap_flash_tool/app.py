@@ -241,7 +241,7 @@ class DapFlashApp(QWidget):
         self.progress_bar.setFixedHeight(14)
         self.progress_bar.setTextVisible(True)
         self.progress_bar.hide()
-        self.elapsed_label = QLabel("耗时 00:00")
+        self.elapsed_label = QLabel("用时 00:00")
         self.elapsed_label.setObjectName("elapsedLabel")
         self.elapsed_label.hide()
         status_lay.addWidget(self.progress_bar)
@@ -602,7 +602,7 @@ class DapFlashApp(QWidget):
         elapsed = self._stop_operation_progress(code == 0)
         if output.strip():
             self._append_log(output)
-        elapsed_text = f"，耗时 {self._format_elapsed(elapsed)}" if elapsed is not None else ""
+        elapsed_text = f"，用时 {self._format_elapsed(elapsed)}" if elapsed is not None else ""
         if code == 0:
             self._append_log(f"[{self._now()}] {success_message or f'完成：{name}'}{elapsed_text}")
             self._set_busy(False, status="完成")
@@ -614,7 +614,7 @@ class DapFlashApp(QWidget):
 
     def _fail_command(self, name: str, message: str) -> None:
         elapsed = self._stop_operation_progress(False)
-        elapsed_text = f"，耗时 {self._format_elapsed(elapsed)}" if elapsed is not None else ""
+        elapsed_text = f"，用时 {self._format_elapsed(elapsed)}" if elapsed is not None else ""
         self._append_log(f"[{self._now()}] 异常：{name}{elapsed_text}\n{message}")
         self._set_busy(False, status="异常")
         QMessageBox.warning(self, name, message)
@@ -1085,8 +1085,11 @@ class DapFlashApp(QWidget):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("运行中")
         self.progress_bar.setToolTip(action)
+        self.progress_bar.setProperty("state", "")
+        self.progress_bar.style().unpolish(self.progress_bar)
+        self.progress_bar.style().polish(self.progress_bar)
         self.progress_bar.show()
-        self.elapsed_label.setText("耗时 00:00")
+        self.elapsed_label.setText("用时 00:00")
         self.elapsed_label.show()
         self._elapsed_timer.start()
 
@@ -1104,7 +1107,7 @@ class DapFlashApp(QWidget):
     def _refresh_elapsed(self) -> None:
         if self._command_started_at is None:
             return
-        self.elapsed_label.setText(f"耗时 {self._format_elapsed(time.perf_counter() - self._command_started_at)}")
+        self.elapsed_label.setText(f"用时 {self._format_elapsed(time.perf_counter() - self._command_started_at)}")
 
     def _stop_operation_progress(self, success: bool) -> float | None:
         started_at = self._command_started_at
@@ -1113,13 +1116,16 @@ class DapFlashApp(QWidget):
         self._elapsed_timer.stop()
         self._command_started_at = None
         if elapsed is not None and was_progress:
-            self.elapsed_label.setText(f"耗时 {self._format_elapsed(elapsed)}")
+            self.elapsed_label.setText(f"用时 {self._format_elapsed(elapsed)}")
             self.elapsed_label.show()
         if was_progress:
             current_value = min(100, max(0, self.progress_bar.value()))
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(100 if success else current_value)
             self.progress_bar.setFormat("100%" if success else "失败")
+            self.progress_bar.setProperty("state", "success" if success else "error")
+            self.progress_bar.style().unpolish(self.progress_bar)
+            self.progress_bar.style().polish(self.progress_bar)
             self.progress_bar.show()
         else:
             self.progress_bar.hide()

@@ -157,16 +157,26 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 #statusBar QLabel { color: #9aa3b2; }
 #statusClock { font-family: Consolas, "Courier New", monospace; }
 #operationProgress {
-    background: #14171d;
-    border: 1px solid #343a47;
-    border-radius: 4px;
+    background: #151922;
+    border: 1px solid #2c3442;
+    border-radius: 7px;
     color: #e6e9ef;
     text-align: center;
     font-size: 10px;
 }
 #operationProgress::chunk {
-    background: #2d6fdb;
-    border-radius: 3px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #1d4ed8, stop:0.5 #2d6fdb, stop:1 #4a8bef);
+    border-radius: 6px;
+    margin: 1px;
+}
+#operationProgress::chunk[state="success"] {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #059669, stop:0.5 #10b981, stop:1 #34d399);
+}
+#operationProgress::chunk[state="error"] {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #b91c1c, stop:0.5 #dc2626, stop:1 #ef4444);
 }
 #elapsedLabel { font-family: Consolas, "Courier New", monospace; }
 #statusBar[winMaximized="true"] { border-bottom-left-radius: 0px; border-bottom-right-radius: 0px; }
@@ -339,16 +349,26 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 #statusBar QLabel { color: #6a7280; }
 #statusClock { font-family: Consolas, "Courier New", monospace; }
 #operationProgress {
-    background: #ffffff;
-    border: 1px solid #c3cbd6;
-    border-radius: 4px;
+    background: #eef1f6;
+    border: 1px solid #cbd5e1;
+    border-radius: 7px;
     color: #1f242b;
     text-align: center;
     font-size: 10px;
 }
 #operationProgress::chunk {
-    background: #3d7ee8;
-    border-radius: 3px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #2563eb, stop:0.5 #3b82f6, stop:1 #60a5fa);
+    border-radius: 6px;
+    margin: 1px;
+}
+#operationProgress::chunk[state="success"] {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #059669, stop:0.5 #10b981, stop:1 #34d399);
+}
+#operationProgress::chunk[state="error"] {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #dc2626, stop:0.5 #ef4444, stop:1 #f87171);
 }
 #elapsedLabel { font-family: Consolas, "Courier New", monospace; }
 #statusBar[winMaximized="true"] { border-bottom-left-radius: 0px; border-bottom-right-radius: 0px; }
