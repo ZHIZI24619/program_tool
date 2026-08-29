@@ -202,6 +202,8 @@ class DapFlashApp(QWidget):
         self._closing = False
 
         self._build_ui()
+        for warning in self.pack_library.warnings:
+            self._append_log(warning)
         self._load_pack_library()
         self._restore_settings()
         self._restore_last_chip()

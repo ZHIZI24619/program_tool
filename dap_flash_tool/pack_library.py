@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import hashlib
 import shutil
 import sys
 import zipfile
@@ -40,7 +40,7 @@ class PackDefinition:
 
     @property
     def display_name(self) -> str:
-        return f"{self.name}  —  {self.path}"
+        return f"{self.name}  -  {self.path}"
 
     def algorithm_display(self, chip: ChipDefinition) -> str:
         algorithm = chip.effective_algorithm
@@ -55,14 +55,15 @@ class PackDefinition:
 
 
 class PackLibrary:
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self, cache_path: Path | None = None) -> None:
         self.cache_path = cache_path or self.default_cache_path()
         self.storage_path = self.default_storage_path()
         self.packs: list[PackDefinition] = []
+        self.warnings: list[str] = []
         self.load()
-        self.migrate_to_storage()
+        self.sync_from_storage()
 
     @staticmethod
     def default_cache_path() -> Path:
@@ -86,14 +87,15 @@ class PackLibrary:
                     name=item.get("name") or Path(item["path"]).stem,
                     modified_ns=item.get("modified_ns", 0),
                     size=item.get("size", 0),
-                    source_path=item.get("source_path", ""),
+                    source_path="",
                     chips=[ChipDefinition(**chip) for chip in item.get("chips", [])],
                 )
                 for item in data.get("packs", [])
                 if item.get("path")
             ]
-        except (OSError, ValueError, TypeError, KeyError):
+        except (OSError, ValueError, TypeError, KeyError) as exc:
             self.packs = []
+            self.warnings.append(f"芯片包缓存读取失败，已忽略旧缓存：{exc}")
 
     def save(self) -> None:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,28 +108,18 @@ class PackLibrary:
         source = Path(path_value).expanduser().resolve()
         if not source.exists():
             raise ValueError(f"Pack 文件或目录不存在：{source}")
+
         managed = source if self._is_in_storage(source) else self._copy_to_storage(source)
         record = self._parse(managed)
-        record.source_path = str(source)
-        previous = next(
-            (
-                pack
-                for pack in self.packs
-                if self._path_key(pack.path) == self._path_key(str(managed))
-                or self._path_key(pack.source_path) == self._path_key(str(source))
-            ),
-            None,
-        )
+        record.source_path = ""
+
+        previous = next((pack for pack in self.packs if self._path_key(pack.path) == self._path_key(str(managed))), None)
         if previous:
             manual_algorithms = {chip.target: chip.manual_algorithm for chip in previous.chips if chip.manual_algorithm}
             for chip in record.chips:
                 chip.manual_algorithm = manual_algorithms.get(chip.target, "")
-        self.packs = [
-            pack
-            for pack in self.packs
-            if self._path_key(pack.path) != self._path_key(str(managed))
-            and self._path_key(pack.source_path) != self._path_key(str(source))
-        ]
+
+        self.packs = [pack for pack in self.packs if self._path_key(pack.path) != self._path_key(str(managed))]
         self.packs.append(record)
         self.packs.sort(key=lambda pack: pack.name.lower())
         self.save()
@@ -141,21 +133,29 @@ class PackLibrary:
             self._delete_managed_copy(Path(pack.path))
         self.save()
 
-    def migrate_to_storage(self) -> None:
-        changed = False
-        for pack in self.packs:
-            current = Path(pack.path).expanduser()
-            if self._is_in_storage(current) or not current.exists():
+    def sync_from_storage(self) -> None:
+        cached = {self._path_key(pack.path): pack for pack in self.packs}
+        loaded: list[PackDefinition] = []
+
+        for path in self._storage_candidates():
+            key = self._path_key(str(path))
+            cached_pack = cached.get(key)
+            if cached_pack and self._metadata_matches(path, cached_pack):
+                cached_pack.path = str(path)
+                cached_pack.source_path = ""
+                loaded.append(cached_pack)
                 continue
-            managed = self._copy_to_storage(current)
-            pack.source_path = pack.source_path or str(current)
-            pack.path = str(managed)
-            stat = managed.stat()
-            pack.modified_ns = stat.st_mtime_ns
-            pack.size = stat.st_size if managed.is_file() else 0
-            changed = True
-        if changed:
-            self.save()
+
+            try:
+                loaded.append(self._parse(path))
+            except (OSError, ValueError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+                self.warnings.append(f"芯片包加载失败，已跳过：{path}，原因：{exc}")
+
+        self.packs = sorted(loaded, key=lambda pack: pack.name.lower())
+        self._save_quietly()
+
+    def migrate_to_storage(self) -> None:
+        self.sync_from_storage()
 
     def set_manual_algorithm(self, pack_path: str, target: str, algorithm_path: str) -> None:
         for pack in self.packs:
@@ -193,6 +193,7 @@ class PackLibrary:
             name=pack_name,
             modified_ns=stat.st_mtime_ns,
             size=stat.st_size if path.is_file() else 0,
+            source_path="",
             chips=sorted(chips.values(), key=lambda chip: (chip.vendor.lower(), chip.series.lower(), chip.target.lower())),
         )
 
@@ -259,7 +260,36 @@ class PackLibrary:
     def _local_name(tag: str) -> str:
         return tag.rsplit("}", 1)[-1]
 
+    def _storage_candidates(self) -> list[Path]:
+        storage = self.storage_path
+        if not storage.is_dir():
+            return []
+
+        candidates: list[Path] = []
+        try:
+            children = sorted(storage.iterdir(), key=lambda item: item.name.lower())
+        except OSError as exc:
+            self.warnings.append(f"芯片包目录读取失败：{storage}，原因：{exc}")
+            return []
+
+        for child in children:
+            if child.is_file() and child.suffix.lower() == ".pack":
+                candidates.append(child)
+            elif child.is_dir() and any(child.rglob("*.pdsc")):
+                candidates.append(child)
+        return candidates
+
+    def _metadata_matches(self, path: Path, pack: PackDefinition) -> bool:
+        try:
+            stat = path.stat()
+        except OSError:
+            return False
+        return stat.st_mtime_ns == pack.modified_ns and (stat.st_size if path.is_file() else 0) == pack.size
+
     def _copy_to_storage(self, source: Path) -> Path:
+        if not source.exists():
+            raise FileNotFoundError(f"Pack 文件或目录不存在：{source}")
+
         storage = self.storage_path
         storage.mkdir(parents=True, exist_ok=True)
         target = storage / self._managed_name(source)
@@ -297,3 +327,9 @@ class PackLibrary:
                 resolved.unlink(missing_ok=True)
         except (OSError, ValueError):
             pass
+
+    def _save_quietly(self) -> None:
+        try:
+            self.save()
+        except OSError as exc:
+            self.warnings.append(f"芯片包缓存保存失败：{exc}")
