@@ -41,6 +41,7 @@ from PyQt5.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QStyle,
     QStyleOptionButton,
     QTableWidget,
@@ -196,6 +197,9 @@ class DapFlashApp(QWidget):
         self._elapsed_timer.setInterval(250)
         self._elapsed_timer.timeout.connect(self._refresh_elapsed)
         self._progress_enabled = False
+        self._busy = False
+        self._update_check_running = False
+        self._closing = False
 
         self._build_ui()
         self._load_pack_library()
@@ -204,7 +208,7 @@ class DapFlashApp(QWidget):
         self._apply_theme()
 
         QTimer.singleShot(0, self._deferred_center)
-        QTimer.singleShot(800, self.refresh_probes)
+        QTimer.singleShot(0, self._refresh_probes_on_startup)
         QTimer.singleShot(2000, self._check_update_on_startup)
 
     # ------------------------------------------------------------- UI
@@ -299,7 +303,9 @@ class DapFlashApp(QWidget):
         toolbar.addWidget(QLabel("调试器 "))
         self.probe_combo = QComboBox()
         self.probe_combo.setEditable(False)
-        self.probe_combo.setMinimumWidth(260)
+        self.probe_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.probe_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._lock_probe_combo_width()
         toolbar.addWidget(self.probe_combo)
 
         self.btn_refresh = QPushButton("刷新")
@@ -470,10 +476,22 @@ class DapFlashApp(QWidget):
             QMessageBox.warning(self, "保存设置", f"无法保存上次使用记录：{exc}")
 
     def closeEvent(self, event) -> None:
+        if self._busy:
+            self._append_log(f"[{self._now()}] 当前任务仍在执行，暂不关闭窗口。")
+            event.ignore()
+            return
+        self._closing = True
+        self._elapsed_timer.stop()
         self._save_settings()
         super().closeEvent(event)
 
     # ------------------------------------------------------------- actions
+    def _refresh_probes_on_startup(self) -> None:
+        if self._busy or QApplication.activeModalWidget() is not None:
+            QTimer.singleShot(1000, self._refresh_probes_on_startup)
+            return
+        self.refresh_probes()
+
     def refresh_probes(self) -> None:
         self._run_command("刷新探针", self._list_probes, self._update_probe_list)
 
@@ -484,10 +502,12 @@ class DapFlashApp(QWidget):
         return code, output
 
     def detect_chip(self) -> None:
-        self._run_command("检测连接", lambda: self._target_command(self.backend.detect_chip))
+        options = self._collect_options()
+        self._run_command("检测连接", lambda: self._target_command(self.backend.detect_chip, options))
 
     def erase_chip(self) -> None:
-        self._run_command("擦除", lambda progress: self.backend.erase(self._collect_options(), progress), show_progress=True)
+        options = self._collect_options()
+        self._run_command("擦除", lambda progress: self.backend.erase(options, progress), show_progress=True)
 
     def download_firmware(self) -> None:
         options = self._collect_options()
@@ -504,10 +524,12 @@ class DapFlashApp(QWidget):
             self._start_download_stage(options)
 
     def verify_firmware(self) -> None:
-        self._run_command("校验", lambda progress: self.backend.verify(self._collect_options(), progress), show_progress=True)
+        options = self._collect_options()
+        self._run_command("校验", lambda progress: self.backend.verify(options, progress), show_progress=True)
 
     def reset_run(self) -> None:
-        self._run_command("复位运行", lambda progress: self.backend.reset_run(self._collect_options()), show_progress=True)
+        options = self._collect_options()
+        self._run_command("复位运行", lambda progress: self.backend.reset_run(options), show_progress=True)
 
     def _after_download(self, options: FlashOptions, _output: str) -> None:
         if options.verify_after_download:
@@ -545,8 +567,7 @@ class DapFlashApp(QWidget):
             show_progress=True,
         )
 
-    def _target_command(self, command: Callable[[FlashOptions], tuple[int, str]]) -> tuple[int, str]:
-        options = self._collect_options()
+    def _target_command(self, command: Callable[[FlashOptions], tuple[int, str]], options: FlashOptions) -> tuple[int, str]:
         code, output = command(options)
         if self.backend.has_no_target(output):
             return 0, "未连接目标芯片，请确认目标板已上电、SWD 接线正确，并尝试降低 DAP 频率后重试。"
@@ -575,6 +596,9 @@ class DapFlashApp(QWidget):
         success_message: str | None = None,
         show_progress: bool = False,
     ) -> None:
+        if self._busy:
+            self._append_log(f"[{self._now()}] 已有任务正在执行，跳过：{name}")
+            return
         self._set_busy(True, name)
         if show_progress:
             self._start_operation_progress(name)
@@ -587,18 +611,23 @@ class DapFlashApp(QWidget):
             try:
                 if show_progress:
                     def report_progress(percent: int | None, text: str = "") -> None:
-                        self._signals.progress.emit(name, -1 if percent is None else int(percent), text)
+                        if not self._closing:
+                            self._signals.progress.emit(name, -1 if percent is None else int(percent), text)
 
                     code, output = task(report_progress)
                 else:
                     code, output = task()
-                self._signals.finished.emit(name, code, output, success_handler, success_message)
+                if not self._closing:
+                    self._signals.finished.emit(name, code, output, success_handler, success_message)
             except Exception as exc:
-                self._signals.failed.emit(name, str(exc))
+                if not self._closing:
+                    self._signals.failed.emit(name, str(exc))
 
         threading.Thread(target=execute, daemon=True).start()
 
     def _finish_command(self, name: str, code: int, output: str, success_handler, success_message) -> None:
+        if self._closing:
+            return
         elapsed = self._stop_operation_progress(code == 0)
         if output.strip():
             self._append_log(output)
@@ -613,6 +642,8 @@ class DapFlashApp(QWidget):
             self._set_busy(False, status="失败")
 
     def _fail_command(self, name: str, message: str) -> None:
+        if self._closing:
+            return
         elapsed = self._stop_operation_progress(False)
         elapsed_text = f"，用时 {self._format_elapsed(elapsed)}" if elapsed is not None else ""
         self._append_log(f"[{self._now()}] 异常：{name}{elapsed_text}\n{message}")
@@ -850,10 +881,19 @@ class DapFlashApp(QWidget):
     def _check_update_on_startup(self) -> None:
         from .updater import STATE_FOUND, Updater
 
+        if self._closing:
+            return
+        if self._update_check_running:
+            return
+
         updater = Updater(self)
         self._updater = updater
+        self._update_check_running = True
 
         def on_result(state, new_version, info) -> None:
+            self._update_check_running = False
+            if self._closing:
+                return
             if state == STATE_FOUND:
                 self._update_info = info
                 self.btn_check_update.setText(f"更新 v{new_version}")
@@ -903,6 +943,14 @@ class DapFlashApp(QWidget):
         for widget in QApplication.allWidgets():
             widget.style().unpolish(widget)
             widget.style().polish(widget)
+        self._lock_probe_combo_width()
+
+    def _lock_probe_combo_width(self) -> None:
+        width = 260
+        self.probe_combo.setMinimumWidth(width)
+        self.probe_combo.setMaximumWidth(width)
+        self.probe_combo.setFixedWidth(width)
+        self.probe_combo.updateGeometry()
 
     def _make_moon_icon(self, color: QColor, size: int = 24) -> QPixmap:
         pm = QPixmap(size, size)
@@ -1134,6 +1182,7 @@ class DapFlashApp(QWidget):
         return elapsed
 
     def _set_busy(self, busy: bool, action: str = "", status: str = "就绪") -> None:
+        self._busy = busy
         for button in self.action_buttons:
             button.setEnabled(not busy)
         text = f"执行中：{action}" if busy else status

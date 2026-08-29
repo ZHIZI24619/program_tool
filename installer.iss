@@ -3,7 +3,7 @@
 ; 用 ISCC.exe 编译本脚本，产物输出到 installer\DAPFlashTool-Setup-*.exe
 
 #define MyAppName "DAP Flash Tool"
-#define MyAppVersion "0.3.0"
+#define MyAppVersion "0.3.1"
 #define MyAppExeName "DAPFlashTool.exe"
 ; PyInstaller onedir 产物目录名（dist\DAPFlashTool\ -> 安装到 {app}\DAPFlashTool\）
 #define MyAppFolder "DAPFlashTool"
