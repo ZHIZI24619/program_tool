@@ -3,18 +3,9 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectRoot
 
-$PythonCandidates = @(
-    (Join-Path $ProjectRoot ".venv-win\Scripts\python.exe"),
-    (Join-Path $ProjectRoot ".venv\Scripts\python.exe"),
-    (Join-Path $ProjectRoot ".venv\bin\python.exe"),
-    (Join-Path (Split-Path -Parent $ProjectRoot) ".venv\Scripts\python.exe"),
-    (Join-Path (Split-Path -Parent $ProjectRoot) ".venv\bin\python.exe")
-)
-
-$Python = $PythonCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $Python) {
-    $Python = "python"
-}
+# 统一使用系统 Python（不再使用项目内虚拟环境）
+$Python = "C:\Users\35370\AppData\Local\Programs\Python\Python312\python.exe"
+if (-not (Test-Path $Python)) { $Python = "python" }
 
 & $Python -m pip install -r requirements.txt
 & $Python -m PyInstaller `
@@ -24,11 +15,14 @@ if (-not $Python) {
     --name DAPFlashTool `
     --paths $ProjectRoot `
     --hidden-import dap_flash_tool.app `
+    --add-data "assets;assets" `
+    --icon assets\logo.ico `
     launcher.py
 
 $PyOcdExe = Join-Path (Split-Path -Parent $Python) "pyocd.exe"
+if (-not (Test-Path $PyOcdExe)) { $PyOcdExe = Join-Path (Split-Path -Parent $Python) "Scripts\pyocd.exe" }
 if (-not (Test-Path $PyOcdExe)) {
-    throw "pyocd.exe not found beside Python: $PyOcdExe"
+    throw "pyocd.exe not found beside Python"
 }
 Copy-Item $PyOcdExe (Join-Path $ProjectRoot "dist\DAPFlashTool\pyocd.exe") -Force
 

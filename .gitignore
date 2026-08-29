@@ -6,6 +6,7 @@ __pycache__/
 *.spec
 build/
 dist/
+installer/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

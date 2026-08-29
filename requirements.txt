@@ -1,4 +1,5 @@
 pyocd>=0.36
 pyinstaller>=6.10
-ttkbootstrap>=1.10
 pyelftools>=0.30
+PyQt5>=5.15
+Pillow>=9.0

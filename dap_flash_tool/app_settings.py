@@ -18,6 +18,7 @@ class AppSettings:
     chip_erase: bool = False
     verify: bool = True
     reset_after_download: bool = True
+    dark_mode: bool = True
 
 
 class AppSettingsStore:

@@ -285,7 +285,10 @@ class PyOcdBackend:
                 probes.append(f"{row.group(3)}  |  {row.group(2).strip()}  |  {row.group(4).strip()}")
                 continue
 
-            fallback = re.search(r"\b([0-9A-Fa-f]{4,})\b", line)
+            lower = line.lower()
+            if not any(marker in lower for marker in ("unique id", "uid", "serial")):
+                continue
+            fallback = re.search(r"\b([0-9A-Fa-f]{8,})\b", line)
             if fallback:
                 probes.append(fallback.group(1))
         return sorted(dict.fromkeys(probes))
