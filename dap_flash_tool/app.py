@@ -309,11 +309,9 @@ class DapFlashApp(QWidget):
         self.btn_check_update = QPushButton("更新")
         self.btn_check_update.setObjectName("btnUpdate")
         self.btn_check_update.clicked.connect(self._start_update)
-        self.btn_check_update.setVisible(False)
-        toolbar.addWidget(self.btn_check_update)
+        self._update_action = toolbar.addWidget(self.btn_check_update)
         self._update_sep_b = toolbar.addSeparator()
-        self._update_sep_a.setVisible(False)
-        self._update_sep_b.setVisible(False)
+        self._set_update_button_visible(False)
 
         self.status_badge = QLabel("就绪")
         self.status_badge.setObjectName("badgeReady")
@@ -819,9 +817,7 @@ class DapFlashApp(QWidget):
             if state == STATE_FOUND:
                 self._update_info = info
                 self.btn_check_update.setText(f"更新 v{new_version}")
-                self.btn_check_update.setVisible(True)
-                self._update_sep_a.setVisible(True)
-                self._update_sep_b.setVisible(True)
+                self._set_update_button_visible(True)
 
         updater.check(on_result)
 
@@ -830,9 +826,7 @@ class DapFlashApp(QWidget):
 
         info = getattr(self, "_update_info", None)
         if not info:
-            self.btn_check_update.setVisible(False)
-            self._update_sep_a.setVisible(False)
-            self._update_sep_b.setVisible(False)
+            self._set_update_button_visible(False)
             return
         new_version = info.get("version")
         ret = QMessageBox.question(
@@ -1058,6 +1052,12 @@ class DapFlashApp(QWidget):
             self._set_badge_style("badgeError")
         else:
             self._set_badge_style("badgeReady")
+
+    def _set_update_button_visible(self, visible: bool) -> None:
+        self.btn_check_update.setVisible(visible)
+        self._update_action.setVisible(visible)
+        self._update_sep_a.setVisible(visible)
+        self._update_sep_b.setVisible(visible)
 
     def _set_badge_style(self, name: str) -> None:
         self.status_badge.setObjectName(name)
