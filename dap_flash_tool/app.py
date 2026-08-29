@@ -725,7 +725,7 @@ class DapFlashApp(QWidget):
             if row < 0:
                 return
             pack = table.item(row, 0).data(Qt.UserRole)
-            if not QMessageBox.question(dialog, "移除 Pack", f"从缓存库移除 {pack.name}？\n不会删除原始 Pack 文件。") == QMessageBox.Yes:
+            if not QMessageBox.question(dialog, "移除 Pack", f"从芯片库移除 {pack.name}？") == QMessageBox.Yes:
                 return
             self.pack_library.remove(pack.path)
             if self.selected_chip and self.selected_chip[0].path == pack.path:
