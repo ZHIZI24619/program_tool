@@ -528,39 +528,73 @@ class DapFlashApp(QWidget):
 
     def detect_chip(self) -> None:
         options = self._collect_options()
-        self._run_command("检测连接", lambda: self._target_command(self.backend.detect_chip, options))
+        self._run_after_probe_check(
+            "检测连接",
+            options,
+            lambda: self._run_command(
+                "检测连接",
+                lambda: self._target_command(lambda opts: self.backend.detect_chip(opts, check_probe=False), options),
+            ),
+        )
 
     def erase_chip(self) -> None:
         options = self._collect_options()
-        self._run_command("擦除", lambda progress: self.backend.erase(options, progress), show_progress=True)
+        self._run_after_probe_check(
+            "擦除",
+            options,
+            lambda: self._run_command(
+                "擦除",
+                lambda progress: self.backend.erase(options, progress, check_probe=False),
+                show_progress=True,
+            ),
+        )
 
     def download_firmware(self) -> None:
         options = self._collect_options()
+        self._run_after_probe_check("下载", options, lambda: self._start_download_flow(options))
+
+    def _start_download_flow(self, options: FlashOptions) -> None:
         if options.chip_erase:
             self._run_command(
                 "擦除",
-                lambda progress: self.backend.erase(options, progress),
-                lambda _output: self._start_download_stage(options),
+                lambda progress: self.backend.erase(options, progress, check_probe=False),
+                lambda _output: self._start_download_stage(options, check_probe=False),
                 start_message="开始擦除",
                 success_message="擦除完成",
                 show_progress=True,
             )
         else:
-            self._start_download_stage(options)
+            self._start_download_stage(options, check_probe=False)
 
     def verify_firmware(self) -> None:
         options = self._collect_options()
-        self._run_command("校验", lambda progress: self.backend.verify(options, progress), show_progress=True)
+        self._run_after_probe_check(
+            "校验",
+            options,
+            lambda: self._run_command(
+                "校验",
+                lambda progress: self.backend.verify(options, progress, check_probe=False),
+                show_progress=True,
+            ),
+        )
 
     def reset_run(self) -> None:
         options = self._collect_options()
-        self._run_command("复位运行", lambda progress: self.backend.reset_run(options), show_progress=True)
+        self._run_after_probe_check(
+            "复位运行",
+            options,
+            lambda: self._run_command(
+                "复位运行",
+                lambda progress: self.backend.reset_run(options, check_probe=False),
+                show_progress=True,
+            ),
+        )
 
     def _after_download(self, options: FlashOptions, _output: str) -> None:
         if options.verify_after_download:
             self._run_command(
                 "检验",
-                lambda progress: self.backend.verify(options, progress),
+                lambda progress: self.backend.verify(options, progress, check_probe=False),
                 lambda _verify_output: self._after_verify(options),
                 start_message="开始检验",
                 success_message="检验完成",
@@ -573,10 +607,10 @@ class DapFlashApp(QWidget):
         if options.reset_after_download:
             self._start_reset_stage(options)
 
-    def _start_download_stage(self, options: FlashOptions) -> None:
+    def _start_download_stage(self, options: FlashOptions, check_probe: bool) -> None:
         self._run_command(
             "下载",
-            lambda progress: self.backend.download(options, progress),
+            lambda progress: self.backend.download(options, progress, check_probe=check_probe),
             lambda output: self._after_download(options, output),
             start_message="开始下载",
             success_message="下载完成",
@@ -586,17 +620,14 @@ class DapFlashApp(QWidget):
     def _start_reset_stage(self, options: FlashOptions) -> None:
         self._run_command(
             "复位运行",
-            lambda progress: self.backend.reset_run(options),
+            lambda progress: self.backend.reset_run(options, check_probe=False),
             start_message="开始复位运行",
             success_message="复位运行完成",
             show_progress=True,
         )
 
     def _target_command(self, command: Callable[[FlashOptions], tuple[int, str]], options: FlashOptions) -> tuple[int, str]:
-        code, output = command(options)
-        if self.backend.has_no_target(output):
-            return 0, "未连接目标芯片，请确认目标板已上电、SWD 接线正确，并尝试降低 DAP 频率后重试。"
-        return code, output
+        return command(options)
 
     def _collect_options(self) -> FlashOptions:
         return FlashOptions(
@@ -613,6 +644,25 @@ class DapFlashApp(QWidget):
             reset_after_download=self.reset_check.isChecked(),
             flash_start=self.selected_chip[1].flash_start if self.selected_chip else None,
             flash_size=self.selected_chip[1].flash_size if self.selected_chip else None,
+        )
+
+    def _require_probe_for_action(self, action: str) -> bool:
+        if self.probe_combo.currentIndex() >= 0 and self.probe_combo.currentText().strip():
+            return True
+        message = "未检测到 DAP 调试器，请插入调试器后点击刷新，再重新执行。"
+        self._append_log(f"[{self._now()}] {message}")
+        self.status_label.setText("未检测到 DAP 调试器")
+        return False
+
+    def _run_after_probe_check(self, action: str, options: FlashOptions, starter: Callable[[], None]) -> None:
+        if not self._require_probe_for_action(action):
+            return
+        self._run_command(
+            "检查探针",
+            lambda: self.backend.check_probe(options),
+            lambda _output: starter(),
+            start_message="检查 DAP 调试器",
+            success_message="DAP 调试器检查完成",
         )
 
     def _run_command(
@@ -676,7 +726,6 @@ class DapFlashApp(QWidget):
         elapsed_text = f"，用时 {self._format_elapsed(elapsed)}" if elapsed is not None else ""
         self._append_log(f"[{self._now()}] 异常：{name}{elapsed_text}\n{message}")
         self._set_busy(False, status="异常")
-        QMessageBox.warning(self, name, message)
 
     # ------------------------------------------------------------- packs
     def select_pack(self) -> None:

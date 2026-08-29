@@ -6,9 +6,12 @@ import hashlib
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Callable, Iterable
 from xml.etree import ElementTree
 
@@ -49,13 +52,21 @@ class FlashOptions:
 
 class PyOcdBackend:
     _PROGRESS_RE = re.compile(r"(?<!\d)(100(?:\.0+)?|[1-9]?\d(?:\.\d+)?)\s*%")
+    _LIST_TIMEOUT_SECONDS = 10.0
+    _COMMAND_TIMEOUT_SECONDS = 300.0
 
     def __init__(self) -> None:
         self._python = sys.executable
         self._frozen = bool(getattr(sys, "frozen", False))
 
     def list_probes(self) -> tuple[int, str]:
-        return self._run(["list"])
+        return self._run(["list"], timeout_seconds=self._LIST_TIMEOUT_SECONDS)
+
+    def check_probe(self, options: FlashOptions) -> tuple[int, str]:
+        probe_error = self._probe_error(options)
+        if probe_error:
+            return probe_error
+        return 0, ""
 
     def show_pack_targets(self, pack_path: str) -> tuple[int, str]:
         args = ["list", "--targets"]
@@ -63,15 +74,27 @@ class PyOcdBackend:
             args.extend(["--pack", pack_path])
         return self._run(args)
 
-    def connect(self, options: FlashOptions) -> tuple[int, str]:
+    def connect(self, options: FlashOptions, check_probe: bool = True) -> tuple[int, str]:
+        if check_probe:
+            probe_error = self._probe_error(options)
+            if probe_error:
+                return probe_error
         args = ["commander", *self._connection_args(options), "-c", "status"]
-        return self._run(args)
+        return self._run_flash_command(args, options)
 
-    def erase(self, options: FlashOptions, progress_callback: ProgressCallback | None = None) -> tuple[int, str]:
+    def erase(self, options: FlashOptions, progress_callback: ProgressCallback | None = None, check_probe: bool = True) -> tuple[int, str]:
+        if check_probe:
+            probe_error = self._probe_error(options)
+            if probe_error:
+                return probe_error
         args = ["erase", *self._connection_args(options), "--chip"]
         return self._run_flash_command(args, options, progress_callback)
 
-    def download(self, options: FlashOptions, progress_callback: ProgressCallback | None = None) -> tuple[int, str]:
+    def download(self, options: FlashOptions, progress_callback: ProgressCallback | None = None, check_probe: bool = True) -> tuple[int, str]:
+        if check_probe:
+            probe_error = self._probe_error(options)
+            if probe_error:
+                return probe_error
         firmware = self._required_file(options.firmware_path, "固件文件")
         args = ["load", *self._connection_args(options)]
         if firmware.suffix.lower() == ".bin":
@@ -82,7 +105,11 @@ class PyOcdBackend:
         args.extend(["-e", "sector", "--no-reset", "-O", "resume_on_disconnect=false", str(firmware)])
         return self._run_flash_command(args, options, progress_callback)
 
-    def verify(self, options: FlashOptions, progress_callback: ProgressCallback | None = None) -> tuple[int, str]:
+    def verify(self, options: FlashOptions, progress_callback: ProgressCallback | None = None, check_probe: bool = True) -> tuple[int, str]:
+        if check_probe:
+            probe_error = self._probe_error(options)
+            if probe_error:
+                return probe_error
         firmware = self._required_file(options.firmware_path, "固件文件")
         if firmware.suffix.lower() in {".elf", ".axf"}:
             return self._verify_elf(firmware, options, progress_callback)
@@ -206,13 +233,21 @@ class PyOcdBackend:
             for path in temporary_files:
                 path.unlink(missing_ok=True)
 
-    def reset_run(self, options: FlashOptions) -> tuple[int, str]:
+    def reset_run(self, options: FlashOptions, check_probe: bool = True) -> tuple[int, str]:
+        if check_probe:
+            probe_error = self._probe_error(options)
+            if probe_error:
+                return probe_error
         args = ["commander", *self._connection_args(options), "-c", "reset", "-c", "go"]
-        return self._run(args)
+        return self._run_flash_command(args, options)
 
-    def detect_chip(self, options: FlashOptions) -> tuple[int, str]:
+    def detect_chip(self, options: FlashOptions, check_probe: bool = True) -> tuple[int, str]:
+        if check_probe:
+            probe_error = self._probe_error(options)
+            if probe_error:
+                return probe_error
         args = ["commander", *self._connection_args(options), "-c", "status", "-c", "show target"]
-        return self._run(args)
+        return self._run_flash_command(args, options)
 
     def find_flash_algorithm(self, pack_path: str, target: str) -> str:
         pack = self._required_path(pack_path, "Pack 文件或目录")
@@ -250,13 +285,39 @@ class PyOcdBackend:
         progress_callback: ProgressCallback | None = None,
     ) -> tuple[int, str]:
         code, output = self._run(args, progress_callback)
+        if self.has_no_probe(output):
+            message = "未检测到 DAP 调试器，请插入调试器后点击刷新，再重新执行。"
+            return code or 1, f"{output}\n\n{message}"
+        if self.has_unknown_target(output):
+            message = "当前目标芯片未被 pyOCD 识别；请确认已选择正确芯片、芯片包仍在芯片库中，并确认目标芯片型号和固件匹配。"
+            return code or 1, f"{output}\n\n{message}"
         if self.has_no_target(output):
-            message = "未连接目标芯片，请确认目标板已上电、SWD 接线正确，并尝试降低 DAP 频率后重试。"
+            message = "DAP 调试器已连接，但无法连接目标芯片；请确认目标板已上电、SWD 接线正确、芯片未损坏，并尝试降低 DAP 频率后重试。"
             return code or 1, f"{output}\n\n{message}"
         if self._has_communication_error(output):
-            message = f"DAP 通信失败，当前频率保持为 {options.frequency.strip() or '默认值'}；请手动降低频率或重新连接后重试。"
+            message = f"DAP 调试器已连接，但与目标芯片通信失败；当前频率为 {options.frequency.strip() or '默认值'}。请检查 SWD 接线、目标供电、复位脚状态，并尝试降低 DAP 频率后重试。"
             return code or 1, f"{output}\n\n{message}"
         return code, output
+
+    def _probe_error(self, options: FlashOptions) -> tuple[int, str] | None:
+        code, output = self.list_probes()
+        probes = self.extract_probe_ids(output)
+        if self.has_no_probe(output):
+            message = "未检测到 DAP 调试器，请插入调试器后点击刷新，再重新执行。"
+            return code or 1, f"{output}\n\n{message}"
+        if not probes:
+            if code != 0:
+                return code, output
+            message = "未检测到 DAP 调试器，请插入调试器后点击刷新，再重新执行。"
+            return 1, f"{output}\n\n{message}"
+
+        selected_uid = self.normalize_probe_uid(options.probe_uid)
+        if selected_uid:
+            connected = {self.normalize_probe_uid(probe) for probe in probes}
+            if selected_uid not in connected:
+                message = f"当前选择的 DAP 调试器已断开：{selected_uid}。请点击刷新后重新选择调试器。"
+                return 1, f"{output}\n\n{message}"
+        return None
 
     @staticmethod
     def _has_communication_error(output: str) -> bool:
@@ -267,14 +328,20 @@ class PyOcdBackend:
                 "unexpected ack",
                 "transfer fault",
                 "memory transfer failed",
-                "no cores were discovered",
                 "error reading ap#",
+                "ap transfer error",
+                "unable to read",
             )
         )
 
     @staticmethod
     def has_no_probe(output: str) -> bool:
         return "no available debug probes are connected" in output.lower()
+
+    @staticmethod
+    def has_unknown_target(output: str) -> bool:
+        lower = output.lower()
+        return "target type" in lower and "not recognized" in lower
 
     @staticmethod
     def has_no_target(output: str) -> bool:
@@ -284,8 +351,8 @@ class PyOcdBackend:
                 "error while initing target",
                 "debugportsetup",
                 "no cores were discovered",
-                "swd/jtag communication failure",
-                "memory transfer failed",
+                "unable to connect to target",
+                "target not connected",
             )
         )
 
@@ -324,12 +391,18 @@ class PyOcdBackend:
             script.write_text(source, encoding="utf-8")
         return script
 
-    def _run(self, args: Iterable[str], progress_callback: ProgressCallback | None = None) -> tuple[int, str]:
+    def _run(
+        self,
+        args: Iterable[str],
+        progress_callback: ProgressCallback | None = None,
+        timeout_seconds: float | None = None,
+    ) -> tuple[int, str]:
         command = self._command(list(args))
         env = os.environ.copy()
         env.setdefault("PYTHONIOENCODING", "utf-8")
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         output_parts: list[str] = []
+        timeout = self._COMMAND_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
         try:
             process = subprocess.Popen(
                 command,
@@ -345,27 +418,59 @@ class PyOcdBackend:
         except FileNotFoundError as exc:
             return 127, f"无法启动 Python 或 pyOCD：{exc}"
 
-        if process.stdout is not None:
-            scan_tail = ""
-            last_percent: int | None = None
-            while True:
-                chunk = process.stdout.read(1)
-                if chunk == "":
-                    if process.poll() is not None:
+        output_queue: Queue[str | None] = Queue()
+
+        def read_output() -> None:
+            try:
+                if process.stdout is None:
+                    return
+                while True:
+                    chunk = process.stdout.read(1)
+                    if chunk == "":
                         break
-                    continue
-                output_parts.append(chunk)
-                if progress_callback:
-                    scan_tail = (scan_tail + chunk)[-160:]
-                    matches = self._PROGRESS_RE.findall(scan_tail)
-                    if matches:
-                        percent = min(100, max(0, int(float(matches[-1]))))
-                        if percent != last_percent:
-                            progress_callback(percent, "")
-                            last_percent = percent
+                    output_queue.put(chunk)
+            finally:
+                output_queue.put(None)
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+
+        timed_out = False
+        finished_reading = process.stdout is None
+        scan_tail = ""
+        last_percent: int | None = None
+        started_at = time.monotonic()
+        while not finished_reading:
+            if process.poll() is None and timeout and time.monotonic() - started_at > timeout:
+                timed_out = True
+                process.kill()
+
+            try:
+                chunk = output_queue.get(timeout=0.1)
+            except Empty:
+                continue
+            if chunk is None:
+                finished_reading = True
+                continue
+            output_parts.append(chunk)
+            if progress_callback:
+                scan_tail = (scan_tail + chunk)[-160:]
+                matches = self._PROGRESS_RE.findall(scan_tail)
+                if matches:
+                    percent = min(100, max(0, int(float(matches[-1]))))
+                    if percent != last_percent:
+                        progress_callback(percent, "")
+                        last_percent = percent
 
         returncode = process.wait()
+        reader.join(timeout=1.0)
         output = "".join(output_parts).replace("\r\n", "\n").replace("\r", "\n").strip()
+        if timed_out:
+            if output:
+                output = f"{output}\n\npyOCD 命令超时，已强制结束。"
+            else:
+                output = "pyOCD 命令超时，已强制结束。"
+            returncode = returncode if returncode not in (0, None) else 124
         if not output:
             output = "命令执行完成，没有额外输出。"
         return returncode, f"$ {self._format_command(command)}\n\n{output}"
