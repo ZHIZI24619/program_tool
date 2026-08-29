@@ -156,6 +156,19 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 }
 #statusBar QLabel { color: #9aa3b2; }
 #statusClock { font-family: Consolas, "Courier New", monospace; }
+#operationProgress {
+    background: #14171d;
+    border: 1px solid #343a47;
+    border-radius: 4px;
+    color: #e6e9ef;
+    text-align: center;
+    font-size: 10px;
+}
+#operationProgress::chunk {
+    background: #2d6fdb;
+    border-radius: 3px;
+}
+#elapsedLabel { font-family: Consolas, "Courier New", monospace; }
 #statusBar[winMaximized="true"] { border-bottom-left-radius: 0px; border-bottom-right-radius: 0px; }
 #hintLabel { color: #9aa3b2; }
 #badgeReady, #badgeRunning, #badgeSuccess, #badgeError {
@@ -325,6 +338,19 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 }
 #statusBar QLabel { color: #6a7280; }
 #statusClock { font-family: Consolas, "Courier New", monospace; }
+#operationProgress {
+    background: #ffffff;
+    border: 1px solid #c3cbd6;
+    border-radius: 4px;
+    color: #1f242b;
+    text-align: center;
+    font-size: 10px;
+}
+#operationProgress::chunk {
+    background: #3d7ee8;
+    border-radius: 3px;
+}
+#elapsedLabel { font-family: Consolas, "Courier New", monospace; }
 #statusBar[winMaximized="true"] { border-bottom-left-radius: 0px; border-bottom-right-radius: 0px; }
 #hintLabel { color: #6a7280; }
 #badgeReady, #badgeRunning, #badgeSuccess, #badgeError {

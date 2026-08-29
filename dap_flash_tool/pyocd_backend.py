@@ -9,8 +9,10 @@ import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 from xml.etree import ElementTree
+
+ProgressCallback = Callable[[int | None, str], None]
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,8 @@ class FlashOptions:
 
 
 class PyOcdBackend:
+    _PROGRESS_RE = re.compile(r"(?<!\d)(100(?:\.0+)?|[1-9]?\d(?:\.\d+)?)\s*%")
+
     def __init__(self) -> None:
         self._python = sys.executable
         self._frozen = bool(getattr(sys, "frozen", False))
@@ -60,11 +64,11 @@ class PyOcdBackend:
         args = ["commander", *self._connection_args(options), "-c", "status"]
         return self._run(args)
 
-    def erase(self, options: FlashOptions) -> tuple[int, str]:
+    def erase(self, options: FlashOptions, progress_callback: ProgressCallback | None = None) -> tuple[int, str]:
         args = ["erase", *self._connection_args(options, connect_mode="under-reset"), "--chip"]
-        return self._run_flash_command(args, options)
+        return self._run_flash_command(args, options, progress_callback)
 
-    def download(self, options: FlashOptions) -> tuple[int, str]:
+    def download(self, options: FlashOptions, progress_callback: ProgressCallback | None = None) -> tuple[int, str]:
         firmware = self._required_file(options.firmware_path, "固件文件")
         args = ["load", *self._connection_args(options, connect_mode="under-reset")]
         if firmware.suffix.lower() == ".bin":
@@ -73,17 +77,17 @@ class PyOcdBackend:
         # pyOCD 默认会在 load 结束时复位，并在断开会话时恢复运行。
         # 两者都关闭，确保检验完成前目标始终保持停止。
         args.extend(["-e", "sector", "--no-reset", "-O", "resume_on_disconnect=false", str(firmware)])
-        return self._run_flash_command(args, options)
+        return self._run_flash_command(args, options, progress_callback)
 
-    def verify(self, options: FlashOptions) -> tuple[int, str]:
+    def verify(self, options: FlashOptions, progress_callback: ProgressCallback | None = None) -> tuple[int, str]:
         firmware = self._required_file(options.firmware_path, "固件文件")
         if firmware.suffix.lower() in {".elf", ".axf"}:
-            return self._verify_elf(firmware, options)
+            return self._verify_elf(firmware, options, progress_callback)
         if firmware.suffix.lower() == ".hex":
-            return self._verify_hex(firmware, options)
+            return self._verify_hex(firmware, options, progress_callback)
         address = self._required_bin_address(options.address)
         args = ["commander", *self._connection_args(options, connect_mode="under-reset"), "-c", f"compare {address} {self._quote_commander_path(firmware)}"]
-        return self._run_compare_command(args, options)
+        return self._run_compare_command(args, options, progress_callback)
 
     @staticmethod
     def _required_bin_address(value: str) -> str:
@@ -97,27 +101,43 @@ class PyOcdBackend:
             raise ValueError(f"起始地址不能为负数：{value}")
         return f"0x{parsed:08X}"
 
-    def _verify_hex(self, firmware: Path, options: FlashOptions) -> tuple[int, str]:
+    def _verify_hex(self, firmware: Path, options: FlashOptions, progress_callback: ProgressCallback | None = None) -> tuple[int, str]:
         temporary_files: list[Path] = []
         outputs: list[str] = []
         try:
-            for address, data in self._hex_data_segments(firmware):
+            segments = self._hex_data_segments(firmware)
+            total_size = sum(len(data) for _address, data in segments) or 1
+            completed_size = 0
+            for address, data in segments:
                 temporary = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
                 temporary.write(data)
                 temporary.close()
                 path = Path(temporary.name)
                 temporary_files.append(path)
                 args = ["commander", *self._connection_args(options, connect_mode="under-reset"), "-c", f"compare 0x{address:08X} {self._quote_commander_path(path)}"]
-                code, output = self._run_compare_command(args, options)
+
+                def segment_progress(percent: int | None, text: str) -> None:
+                    if progress_callback is None:
+                        return
+                    if percent is None:
+                        progress_callback(None, text)
+                        return
+                    mapped = int((completed_size + len(data) * (percent / 100.0)) * 100 / total_size)
+                    progress_callback(min(100, max(0, mapped)), text)
+
+                code, output = self._run_compare_command(args, options, segment_progress)
                 outputs.append(output)
                 if code != 0:
                     return code, "\n\n".join(outputs)
+                completed_size += len(data)
+                if progress_callback:
+                    progress_callback(int(completed_size * 100 / total_size), "")
             return 0, "\n\n".join(outputs)
         finally:
             for path in temporary_files:
                 path.unlink(missing_ok=True)
 
-    def _verify_elf(self, firmware: Path, options: FlashOptions) -> tuple[int, str]:
+    def _verify_elf(self, firmware: Path, options: FlashOptions, progress_callback: ProgressCallback | None = None) -> tuple[int, str]:
         from elftools.elf.elffile import ELFFile
 
         temporary_files: list[Path] = []
@@ -132,6 +152,8 @@ class PyOcdBackend:
                 ]
             if not segments:
                 raise ValueError("ELF/AXF 文件没有可检验的加载段。")
+            total_size = sum(len(data) for _address, data in segments) or 1
+            completed_size = 0
             for address, data in segments:
                 temporary = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
                 temporary.write(data)
@@ -139,10 +161,23 @@ class PyOcdBackend:
                 path = Path(temporary.name)
                 temporary_files.append(path)
                 args = ["commander", *self._connection_args(options, connect_mode="under-reset"), "-c", f"compare 0x{address:08X} {self._quote_commander_path(path)}"]
-                code, output = self._run_compare_command(args, options)
+
+                def segment_progress(percent: int | None, text: str) -> None:
+                    if progress_callback is None:
+                        return
+                    if percent is None:
+                        progress_callback(None, text)
+                        return
+                    mapped = int((completed_size + len(data) * (percent / 100.0)) * 100 / total_size)
+                    progress_callback(min(100, max(0, mapped)), text)
+
+                code, output = self._run_compare_command(args, options, segment_progress)
                 outputs.append(output)
                 if code != 0:
                     return code, "\n\n".join(outputs)
+                completed_size += len(data)
+                if progress_callback:
+                    progress_callback(int(completed_size * 100 / total_size), "")
             return 0, "\n\n".join(outputs)
         finally:
             for path in temporary_files:
@@ -182,8 +217,13 @@ class PyOcdBackend:
             args.extend(["--script", str(self._manual_algorithm_script(algorithm))])
         return args
 
-    def _run_flash_command(self, args: list[str], options: FlashOptions) -> tuple[int, str]:
-        code, output = self._run(args)
+    def _run_flash_command(
+        self,
+        args: list[str],
+        options: FlashOptions,
+        progress_callback: ProgressCallback | None = None,
+    ) -> tuple[int, str]:
+        code, output = self._run(args, progress_callback)
         if self.has_no_target(output):
             message = "未连接目标芯片，请确认目标板已上电、SWD 接线正确，并尝试降低 DAP 频率后重试。"
             return code or 1, f"{output}\n\n{message}"
@@ -223,8 +263,13 @@ class PyOcdBackend:
             )
         )
 
-    def _run_compare_command(self, args: list[str], options: FlashOptions) -> tuple[int, str]:
-        code, output = self._run_flash_command(args, options)
+    def _run_compare_command(
+        self,
+        args: list[str],
+        options: FlashOptions,
+        progress_callback: ProgressCallback | None = None,
+    ) -> tuple[int, str]:
+        code, output = self._run_flash_command(args, options, progress_callback)
         if code == 0 and "bytes match" not in output.lower():
             return 1, output + "\n\n检验未返回数据一致结果。"
         return code, output
@@ -253,16 +298,18 @@ class PyOcdBackend:
             script.write_text(source, encoding="utf-8")
         return script
 
-    def _run(self, args: Iterable[str]) -> tuple[int, str]:
+    def _run(self, args: Iterable[str], progress_callback: ProgressCallback | None = None) -> tuple[int, str]:
         command = self._command(list(args))
         env = os.environ.copy()
         env.setdefault("PYTHONIOENCODING", "utf-8")
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        output_parts: list[str] = []
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 command,
-                check=False,
-                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
@@ -271,10 +318,31 @@ class PyOcdBackend:
             )
         except FileNotFoundError as exc:
             return 127, f"无法启动 Python 或 pyOCD：{exc}"
-        output = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
+
+        if process.stdout is not None:
+            scan_tail = ""
+            last_percent: int | None = None
+            while True:
+                chunk = process.stdout.read(1)
+                if chunk == "":
+                    if process.poll() is not None:
+                        break
+                    continue
+                output_parts.append(chunk)
+                if progress_callback:
+                    scan_tail = (scan_tail + chunk)[-160:]
+                    matches = self._PROGRESS_RE.findall(scan_tail)
+                    if matches:
+                        percent = min(100, max(0, int(float(matches[-1]))))
+                        if percent != last_percent:
+                            progress_callback(percent, "")
+                            last_percent = percent
+
+        returncode = process.wait()
+        output = "".join(output_parts).replace("\r\n", "\n").replace("\r", "\n").strip()
         if not output:
             output = "命令执行完成，没有额外输出。"
-        return completed.returncode, f"$ {self._format_command(command)}\n\n{output}"
+        return returncode, f"$ {self._format_command(command)}\n\n{output}"
 
     @staticmethod
     def extract_probe_ids(output: str) -> list[str]:

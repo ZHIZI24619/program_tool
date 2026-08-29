@@ -5,6 +5,7 @@ import math
 import os
 import sys
 import threading
+import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +39,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QStyle,
     QStyleOptionButton,
@@ -91,6 +93,7 @@ if sys.platform.startswith("win"):
 class _Signals(QObject):
     finished = pyqtSignal(str, int, str, object, object)
     failed = pyqtSignal(str, str)
+    progress = pyqtSignal(str, int, str)
 
 
 class _ThemeRevealOverlay(QWidget):
@@ -187,6 +190,12 @@ class DapFlashApp(QWidget):
         self._signals = _Signals(self)
         self._signals.finished.connect(self._finish_command)
         self._signals.failed.connect(self._fail_command)
+        self._signals.progress.connect(self._update_operation_progress)
+        self._command_started_at: float | None = None
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(250)
+        self._elapsed_timer.timeout.connect(self._refresh_elapsed)
+        self._progress_enabled = False
 
         self._build_ui()
         self._load_pack_library()
@@ -226,6 +235,17 @@ class DapFlashApp(QWidget):
         status_lay.setSpacing(8)
         self.status_label = QLabel("就绪")
         status_lay.addWidget(self.status_label)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setObjectName("operationProgress")
+        self.progress_bar.setFixedWidth(220)
+        self.progress_bar.setFixedHeight(14)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.hide()
+        self.elapsed_label = QLabel("耗时 00:00")
+        self.elapsed_label.setObjectName("elapsedLabel")
+        self.elapsed_label.hide()
+        status_lay.addWidget(self.progress_bar)
+        status_lay.addWidget(self.elapsed_label)
         status_lay.addStretch(1)
         root.addWidget(self.status_bar)
 
@@ -467,35 +487,37 @@ class DapFlashApp(QWidget):
         self._run_command("检测连接", lambda: self._target_command(self.backend.detect_chip))
 
     def erase_chip(self) -> None:
-        self._run_command("擦除", lambda: self.backend.erase(self._collect_options()))
+        self._run_command("擦除", lambda progress: self.backend.erase(self._collect_options(), progress), show_progress=True)
 
     def download_firmware(self) -> None:
         options = self._collect_options()
         if options.chip_erase:
             self._run_command(
                 "擦除",
-                lambda: self.backend.erase(options),
+                lambda progress: self.backend.erase(options, progress),
                 lambda _output: self._start_download_stage(options),
                 start_message="开始擦除",
                 success_message="擦除完成",
+                show_progress=True,
             )
         else:
             self._start_download_stage(options)
 
     def verify_firmware(self) -> None:
-        self._run_command("校验", lambda: self.backend.verify(self._collect_options()))
+        self._run_command("校验", lambda progress: self.backend.verify(self._collect_options(), progress), show_progress=True)
 
     def reset_run(self) -> None:
-        self._run_command("复位运行", lambda: self.backend.reset_run(self._collect_options()))
+        self._run_command("复位运行", lambda progress: self.backend.reset_run(self._collect_options()), show_progress=True)
 
     def _after_download(self, options: FlashOptions, _output: str) -> None:
         if options.verify_after_download:
             self._run_command(
                 "检验",
-                lambda: self.backend.verify(options),
+                lambda progress: self.backend.verify(options, progress),
                 lambda _verify_output: self._after_verify(options),
                 start_message="开始检验",
                 success_message="检验完成",
+                show_progress=True,
             )
         elif options.reset_after_download:
             self._start_reset_stage(options)
@@ -507,18 +529,20 @@ class DapFlashApp(QWidget):
     def _start_download_stage(self, options: FlashOptions) -> None:
         self._run_command(
             "下载",
-            lambda: self.backend.download(options),
+            lambda progress: self.backend.download(options, progress),
             lambda output: self._after_download(options, output),
             start_message="开始下载",
             success_message="下载完成",
+            show_progress=True,
         )
 
     def _start_reset_stage(self, options: FlashOptions) -> None:
         self._run_command(
             "复位运行",
-            lambda: self.backend.reset_run(options),
+            lambda progress: self.backend.reset_run(options),
             start_message="开始复位运行",
             success_message="复位运行完成",
+            show_progress=True,
         )
 
     def _target_command(self, command: Callable[[FlashOptions], tuple[int, str]]) -> tuple[int, str]:
@@ -545,17 +569,29 @@ class DapFlashApp(QWidget):
     def _run_command(
         self,
         name: str,
-        task: Callable[[], tuple[int, str]],
+        task: Callable[..., tuple[int, str]],
         success_handler: Callable[[str], None] | None = None,
         start_message: str | None = None,
         success_message: str | None = None,
+        show_progress: bool = False,
     ) -> None:
         self._set_busy(True, name)
+        if show_progress:
+            self._start_operation_progress(name)
+        else:
+            self._command_started_at = time.perf_counter()
+            self._progress_enabled = False
         self._append_log(f"[{self._now()}] {start_message or f'开始：{name}'}")
 
         def execute() -> None:
             try:
-                code, output = task()
+                if show_progress:
+                    def report_progress(percent: int | None, text: str = "") -> None:
+                        self._signals.progress.emit(name, -1 if percent is None else int(percent), text)
+
+                    code, output = task(report_progress)
+                else:
+                    code, output = task()
                 self._signals.finished.emit(name, code, output, success_handler, success_message)
             except Exception as exc:
                 self._signals.failed.emit(name, str(exc))
@@ -563,19 +599,23 @@ class DapFlashApp(QWidget):
         threading.Thread(target=execute, daemon=True).start()
 
     def _finish_command(self, name: str, code: int, output: str, success_handler, success_message) -> None:
+        elapsed = self._stop_operation_progress(code == 0)
         if output.strip():
             self._append_log(output)
+        elapsed_text = f"，耗时 {self._format_elapsed(elapsed)}" if elapsed is not None else ""
         if code == 0:
-            self._append_log(f"[{self._now()}] {success_message or f'完成：{name}'}")
+            self._append_log(f"[{self._now()}] {success_message or f'完成：{name}'}{elapsed_text}")
             self._set_busy(False, status="完成")
             if success_handler:
                 success_handler(output)
         else:
-            self._append_log(f"[{self._now()}] 失败：{name}，退出码 {code}")
+            self._append_log(f"[{self._now()}] 失败：{name}，退出码 {code}{elapsed_text}")
             self._set_busy(False, status="失败")
 
     def _fail_command(self, name: str, message: str) -> None:
-        self._append_log(f"[{self._now()}] 异常：{name}\n{message}")
+        elapsed = self._stop_operation_progress(False)
+        elapsed_text = f"，耗时 {self._format_elapsed(elapsed)}" if elapsed is not None else ""
+        self._append_log(f"[{self._now()}] 异常：{name}{elapsed_text}\n{message}")
         self._set_busy(False, status="异常")
         QMessageBox.warning(self, name, message)
 
@@ -1038,6 +1078,55 @@ class DapFlashApp(QWidget):
             self.probe_combo.setCurrentIndex(-1)
         self.probe_combo.blockSignals(False)
 
+    def _start_operation_progress(self, action: str) -> None:
+        self._progress_enabled = True
+        self._command_started_at = time.perf_counter()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("运行中")
+        self.progress_bar.setToolTip(action)
+        self.progress_bar.show()
+        self.elapsed_label.setText("耗时 00:00")
+        self.elapsed_label.show()
+        self._elapsed_timer.start()
+
+    def _update_operation_progress(self, name: str, percent: int, text: str) -> None:
+        if not self._progress_enabled:
+            return
+        if percent >= 0:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(min(100, max(0, percent)))
+            self.progress_bar.setFormat("%p%")
+            self.status_label.setText(f"执行中：{name} {min(100, max(0, percent))}%")
+        elif text:
+            self.status_label.setText(f"执行中：{name} {text}")
+
+    def _refresh_elapsed(self) -> None:
+        if self._command_started_at is None:
+            return
+        self.elapsed_label.setText(f"耗时 {self._format_elapsed(time.perf_counter() - self._command_started_at)}")
+
+    def _stop_operation_progress(self, success: bool) -> float | None:
+        started_at = self._command_started_at
+        elapsed = time.perf_counter() - started_at if started_at is not None else None
+        was_progress = self._progress_enabled
+        self._elapsed_timer.stop()
+        self._command_started_at = None
+        if elapsed is not None and was_progress:
+            self.elapsed_label.setText(f"耗时 {self._format_elapsed(elapsed)}")
+            self.elapsed_label.show()
+        if was_progress:
+            current_value = min(100, max(0, self.progress_bar.value()))
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(100 if success else current_value)
+            self.progress_bar.setFormat("100%" if success else "失败")
+            self.progress_bar.show()
+        else:
+            self.progress_bar.hide()
+            self.elapsed_label.hide()
+        self._progress_enabled = False
+        return elapsed
+
     def _set_busy(self, busy: bool, action: str = "", status: str = "就绪") -> None:
         for button in self.action_buttons:
             button.setEnabled(not busy)
@@ -1073,6 +1162,15 @@ class DapFlashApp(QWidget):
     @staticmethod
     def _now() -> str:
         return datetime.now().strftime("%H:%M:%S")
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        total = max(0, int(round(seconds)))
+        hours, rem = divmod(total, 3600)
+        minutes, secs = divmod(rem, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
 
     @staticmethod
     def _set_combo_text(combo: QComboBox, text: str) -> None:
