@@ -15,6 +15,7 @@ class AppSettings:
     firmware_path: str = ""
     address: str = ""
     frequency: str = "10MHz"
+    connect_mode: str = "under-reset"
     chip_erase: bool = False
     verify: bool = True
     reset_after_download: bool = True

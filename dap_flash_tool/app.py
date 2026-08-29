@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -15,6 +16,7 @@ from PyQt5.QtCore import (
     QEvent,
     QPoint,
     QPointF,
+    QRegularExpression,
     QRect,
     QRectF,
     QSize,
@@ -24,7 +26,7 @@ from PyQt5.QtCore import (
     pyqtSignal,
     QObject,
 )
-from PyQt5.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap, QRegion
+from PyQt5.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap, QRegion, QRegularExpressionValidator
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -37,6 +39,7 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListView,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -369,9 +372,27 @@ class DapFlashApp(QWidget):
         self.frequency_combo.setEditable(True)
         target_lay.addWidget(QLabel("DAP 频率："), 1, 0, Qt.AlignRight)
         target_lay.addWidget(self.frequency_combo, 1, 1, 1, 2)
+        self.connect_mode_combo = QComboBox()
+        self.connect_mode_combo.addItems(["under-reset", "halt", "pre-reset", "attach"])
+        self.connect_mode_combo.setToolTip("pyOCD --connect 模式")
+        target_lay.addWidget(QLabel("连接模式："), 2, 0, Qt.AlignRight)
+        target_lay.addWidget(self.connect_mode_combo, 2, 1, 1, 2)
+        self.flash_info_label = QLabel("未知")
+        self.flash_info_label.setObjectName("hintLabel")
+        target_lay.addWidget(QLabel("Flash 范围："), 3, 0, Qt.AlignRight)
+        target_lay.addWidget(self.flash_info_label, 3, 1, 1, 2)
         self.address_edit = QLineEdit()
-        target_lay.addWidget(QLabel("起始地址："), 2, 0, Qt.AlignRight)
-        target_lay.addWidget(self.address_edit, 2, 1, 1, 2)
+        self.address_edit.setValidator(QRegularExpressionValidator(QRegularExpression("[0-9A-Fa-f_]*"), self.address_edit))
+        address_box = QWidget()
+        address_lay = QHBoxLayout(address_box)
+        address_lay.setContentsMargins(0, 0, 0, 0)
+        address_lay.setSpacing(4)
+        address_prefix = QLabel("0x")
+        address_prefix.setObjectName("hintLabel")
+        address_lay.addWidget(address_prefix)
+        address_lay.addWidget(self.address_edit, 1)
+        target_lay.addWidget(QLabel("起始地址："), 4, 0, Qt.AlignRight)
+        target_lay.addWidget(address_box, 4, 1, 1, 2)
         lay.addWidget(target)
 
         files = QGroupBox("算法与固件")
@@ -449,7 +470,8 @@ class DapFlashApp(QWidget):
         s = self.saved_settings
         self.target_edit.setText(s.target)
         self.frequency_combo.setCurrentText(s.frequency or "10MHz")
-        self.address_edit.setText(s.address)
+        self.connect_mode_combo.setCurrentText(s.connect_mode or "under-reset")
+        self._set_address_text(s.address)
         self.algorithm_edit.setText(s.algorithm_path)
         self.firmware_edit.setText(s.firmware_path)
         self.chip_erase_check.setChecked(s.chip_erase)
@@ -463,8 +485,9 @@ class DapFlashApp(QWidget):
             pack_path=self._selected_pack_path(),
             algorithm_path=self.algorithm_edit.text().strip(),
             firmware_path=self.firmware_edit.text().strip(),
-            address=self.address_edit.text().strip(),
+            address=self._address_text(),
             frequency=self.frequency_combo.currentText().strip(),
+            connect_mode=self.connect_mode_combo.currentText().strip(),
             chip_erase=self.chip_erase_check.isChecked(),
             verify=self.verify_check.isChecked(),
             reset_after_download=self.reset_check.isChecked(),
@@ -582,11 +605,14 @@ class DapFlashApp(QWidget):
             pack_path=self._selected_pack_path(),
             algorithm_path=self.algorithm_edit.text().strip(),
             firmware_path=self.firmware_edit.text().strip(),
-            address=self.address_edit.text().strip(),
+            address=self._address_text(),
             frequency=self.frequency_combo.currentText().strip(),
+            connect_mode=self.connect_mode_combo.currentText().strip(),
             chip_erase=self.chip_erase_check.isChecked(),
             verify_after_download=self.verify_check.isChecked(),
             reset_after_download=self.reset_check.isChecked(),
+            flash_start=self.selected_chip[1].flash_start if self.selected_chip else None,
+            flash_size=self.selected_chip[1].flash_size if self.selected_chip else None,
         )
 
     def _run_command(
@@ -706,6 +732,7 @@ class DapFlashApp(QWidget):
                 self.selected_chip = None
                 self.target_edit.clear()
                 self.algorithm_edit.clear()
+                self._update_flash_info(None)
             self._load_pack_library()
             self._append_log(f"已从缓存库移除 Pack：{pack.name}。")
             populate()
@@ -738,31 +765,54 @@ class DapFlashApp(QWidget):
 
         filters = QHBoxLayout()
         search_edit = QLineEdit()
-        search_edit.setPlaceholderText("搜索芯片、厂商、系列或芯片包")
+        search_edit.setPlaceholderText("搜索芯片、厂商、具体系列或芯片包")
         vendor_combo = QComboBox()
-        family_combo = QComboBox()
+        series_group_combo = QComboBox()
+        exact_series_combo = QComboBox()
+        self._configure_filter_combo(vendor_combo)
+        self._configure_filter_combo(series_group_combo)
+        self._configure_filter_combo(exact_series_combo)
         filters.addWidget(search_edit, 1)
         filters.addWidget(vendor_combo)
-        filters.addWidget(family_combo)
+        filters.addWidget(series_group_combo)
+        filters.addWidget(exact_series_combo)
         lay.addLayout(filters)
 
-        table = self._make_table(["芯片型号", "厂商", "系列", "芯片包"])
+        table = self._make_table(["芯片型号", "厂商", "系列", "Flash", "芯片包"])
         self._configure_chip_table(table)
         lay.addWidget(table, 1)
         entries = [(pack, chip) for pack in self.pack_library.packs for chip in pack.chips]
         visible: list[tuple[PackDefinition, ChipDefinition]] = []
 
-        def populate(update_families: bool = False) -> None:
+        def populate(reset_series_group: bool = False, reset_exact_series: bool = False) -> None:
             vendors = sorted({chip.vendor for _pack, chip in entries}, key=str.lower)
             current_vendor = vendor_combo.currentText() or "全部厂商"
             self._replace_combo_items(vendor_combo, ["全部厂商", *vendors], current_vendor)
             vendor = vendor_combo.currentText()
             by_vendor = entries if vendor == "全部厂商" else [item for item in entries if item[1].vendor == vendor]
-            families = sorted({chip.series for _pack, chip in by_vendor}, key=str.lower)
-            current_family = "全部系列" if update_families else (family_combo.currentText() or "全部系列")
-            self._replace_combo_items(family_combo, ["全部系列", *families], current_family)
-            family = family_combo.currentText()
-            matches = by_vendor if family == "全部系列" else [item for item in by_vendor if item[1].series == family]
+
+            series_groups = sorted(
+                {group for _pack, chip in by_vendor if (group := self._chip_series_group(chip))},
+                key=self._series_group_sort_key,
+            )
+            current_series_group = "全部系列组" if reset_series_group else (series_group_combo.currentText() or "全部系列组")
+            self._replace_combo_items(series_group_combo, ["全部系列组", *series_groups], current_series_group)
+            series_group = series_group_combo.currentText()
+            by_series_group = (
+                by_vendor
+                if series_group == "全部系列组"
+                else [item for item in by_vendor if self._chip_series_group(item[1]) == series_group]
+            )
+
+            exact_series_values = sorted({chip.series for _pack, chip in by_series_group}, key=str.lower)
+            current_exact_series = "全部具体系列" if reset_exact_series else (exact_series_combo.currentText() or "全部具体系列")
+            self._replace_combo_items(exact_series_combo, ["全部具体系列", *exact_series_values], current_exact_series)
+            exact_series = exact_series_combo.currentText()
+            matches = (
+                by_series_group
+                if exact_series == "全部具体系列"
+                else [item for item in by_series_group if item[1].series == exact_series]
+            )
             query = search_edit.text().strip().lower()
             if query:
                 matches = [
@@ -776,7 +826,8 @@ class DapFlashApp(QWidget):
                 table.setItem(row, 0, self._item(chip.target, (pack, chip)))
                 table.setItem(row, 1, self._item(chip.vendor))
                 table.setItem(row, 2, self._item(chip.series))
-                table.setItem(row, 3, self._item(pack.name))
+                table.setItem(row, 3, self._item(chip.flash_display))
+                table.setItem(row, 4, self._item(pack.name))
             self._configure_chip_table(table)
 
         def confirm() -> None:
@@ -788,9 +839,10 @@ class DapFlashApp(QWidget):
             self._select_chip(pack, chip)
             dialog.accept()
 
-        vendor_combo.currentTextChanged.connect(lambda _text: populate(True))
-        family_combo.currentTextChanged.connect(lambda _text: populate(False))
-        search_edit.textChanged.connect(lambda _text: populate(False))
+        vendor_combo.currentTextChanged.connect(lambda _text: populate(True, True))
+        series_group_combo.currentTextChanged.connect(lambda _text: populate(False, True))
+        exact_series_combo.currentTextChanged.connect(lambda _text: populate(False, False))
+        search_edit.textChanged.connect(lambda _text: populate(False, False))
         table.doubleClicked.connect(lambda _index: confirm())
 
         buttons = QHBoxLayout()
@@ -822,10 +874,18 @@ class DapFlashApp(QWidget):
             if chip:
                 self._select_chip(pack, chip, log=False)
                 return
+        for pack in self.pack_library.packs:
+            chip = next((item for item in pack.chips if item.target == target), None)
+            if chip:
+                self._select_chip(pack, chip, log=False)
+                return
 
     def _select_chip(self, pack: PackDefinition, chip: ChipDefinition, log: bool = True) -> None:
         self.selected_chip = (pack, chip)
         self.target_edit.setText(chip.target)
+        self._update_flash_info(chip)
+        if self.firmware_edit.text().strip().lower().endswith(".bin") and not self.address_edit.text().strip() and chip.flash_start is not None:
+            self._set_address_text(f"0x{chip.flash_start:08X}")
         self.auto_detect_flash_algorithm()
         if log:
             self._append_log(f"已选择芯片：{chip.vendor} / {chip.series} / {chip.target}（{pack.name}）")
@@ -833,20 +893,25 @@ class DapFlashApp(QWidget):
     def _selected_pack_path(self) -> str:
         if self.selected_chip:
             return self.selected_chip[0].path
-        return self.saved_settings.pack_path if self.target_edit.text().strip() == self.saved_settings.target else ""
+        return ""
 
     def select_algorithm(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(self, "选择 Flash 算法", "", "Flash Algorithm (*.flm *.FLM);;所有文件 (*)")
         if not selected:
             return
-        self.algorithm_edit.setText(selected)
+        try:
+            algorithm_path = self.pack_library.add_algorithm(selected)
+        except Exception as exc:
+            QMessageBox.warning(self, "选择 Flash 算法", f"无法归档 Flash 算法文件：\n{exc}")
+            return
+        self.algorithm_edit.setText(algorithm_path)
         if self.selected_chip:
             pack, chip = self.selected_chip
-            chip.manual_algorithm = selected
-            self.pack_library.set_manual_algorithm(pack.path, chip.target, selected)
-            self._append_log(f"已为 {chip.target} 保存手动算法：{selected}")
+            chip.manual_algorithm = algorithm_path
+            self.pack_library.set_manual_algorithm(pack.path, chip.target, algorithm_path)
+            self._append_log(f"已为 {chip.target} 保存手动算法：{algorithm_path}")
         else:
-            self._append_log("已选择算法文件；选择缓存库中的芯片后才能保存芯片映射。")
+            self._append_log(f"已归档算法文件；选择缓存库中的芯片后才能保存芯片映射。\n{algorithm_path}")
 
     def select_firmware(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(self, "选择固件", "", "Firmware (*.hex *.bin *.elf *.axf);;所有文件 (*)")
@@ -854,7 +919,9 @@ class DapFlashApp(QWidget):
             return
         self.firmware_edit.setText(selected)
         if Path(selected).suffix.lower() in {".hex", ".elf", ".axf"}:
-            self.address_edit.clear()
+            self._set_address_text("")
+        elif not self.address_edit.text().strip() and self.selected_chip and self.selected_chip[1].flash_start is not None:
+            self._set_address_text(f"0x{self.selected_chip[1].flash_start:08X}")
         self.analyze_firmware()
 
     def analyze_firmware(self) -> None:
@@ -865,7 +932,7 @@ class DapFlashApp(QWidget):
             return
         self._append_log(self.backend.format_firmware_info(info))
         if info.min_address is not None and not self.address_edit.text().strip():
-            self.address_edit.setText(f"0x{info.min_address:08X}")
+            self._set_address_text(f"0x{info.min_address:08X}")
 
     def auto_detect_flash_algorithm(self) -> None:
         if not self.selected_chip:
@@ -1229,6 +1296,23 @@ class DapFlashApp(QWidget):
             return f"{hours:02d}:{minutes:02d}:{secs:02d}"
         return f"{minutes:02d}:{secs:02d}"
 
+    def _address_text(self) -> str:
+        value = self.address_edit.text().strip().replace("_", "")
+        if not value:
+            return ""
+        if value.lower().startswith("0x"):
+            value = value[2:]
+        return f"0x{value.upper()}"
+
+    def _set_address_text(self, value: str) -> None:
+        text = str(value or "").strip().replace("_", "")
+        if text.lower().startswith("0x"):
+            text = text[2:]
+        self.address_edit.setText(text.upper())
+
+    def _update_flash_info(self, chip: ChipDefinition | None) -> None:
+        self.flash_info_label.setText(chip.flash_display if chip else "未知")
+
     @staticmethod
     def _set_combo_text(combo: QComboBox, text: str) -> None:
         if text:
@@ -1240,6 +1324,12 @@ class DapFlashApp(QWidget):
         combo.clear()
         combo.addItems(values)
         combo.setCurrentText(current if current in values else values[0])
+        view = combo.view()
+        row_height = view.sizeHintForRow(0) if combo.count() else 22
+        if row_height <= 0:
+            row_height = 22
+        visible_rows = min(max(combo.count(), 1), combo.maxVisibleItems())
+        view.setFixedHeight(row_height * visible_rows + 2)
         combo.blockSignals(False)
 
     @staticmethod
@@ -1256,6 +1346,36 @@ class DapFlashApp(QWidget):
         return table
 
     @staticmethod
+    def _configure_filter_combo(combo: QComboBox) -> None:
+        combo.setMaxVisibleItems(12)
+        combo.setMinimumContentsLength(8)
+        combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        combo.setFixedWidth(136)
+        combo.setStyleSheet("QComboBox { combobox-popup: 0; }")
+        view = QListView(combo)
+        view.setUniformItemSizes(True)
+        view.setMaximumHeight(260)
+        view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        combo.setView(view)
+
+    @staticmethod
+    def _chip_series_group(chip: ChipDefinition) -> str:
+        text = " ".join((chip.target, chip.family, chip.series)).upper()
+        for pattern in (r"\bSTM32([A-Z])(\d)", r"\bHT32([A-Z])(\d)"):
+            match = re.search(pattern, text)
+            if match:
+                return f"{match.group(1)}{match.group(2)}"
+        return ""
+
+    @staticmethod
+    def _series_group_sort_key(value: str) -> tuple[str, int, str]:
+        match = re.fullmatch(r"([A-Z]+)(\d+)", value.upper())
+        if match:
+            return match.group(1), int(match.group(2)), value
+        return value.upper(), -1, value
+
+    @staticmethod
     def _configure_chip_table(table: QTableWidget) -> None:
         header = table.horizontalHeader()
         header.setStretchLastSection(False)
@@ -1263,11 +1383,13 @@ class DapFlashApp(QWidget):
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Stretch)
         table.setColumnWidth(0, 300)
         table.setColumnWidth(1, 150)
         table.setColumnWidth(2, 160)
-        table.setColumnWidth(3, 240)
+        table.setColumnWidth(3, 260)
+        table.setColumnWidth(4, 240)
 
     @staticmethod
     def _item(text: str, data=None) -> QTableWidgetItem:

@@ -39,6 +39,7 @@ QComboBox, QSpinBox {
     padding: 3px 8px;
     min-height: 18px;
 }
+QComboBox { combobox-popup: 0; }
 QComboBox:disabled, QSpinBox:disabled { color: #5a6170; background: #20242d; }
 QComboBox QAbstractItemView {
     background: #1a1e26;
@@ -231,6 +232,7 @@ QComboBox, QSpinBox {
     padding: 3px 8px;
     min-height: 18px;
 }
+QComboBox { combobox-popup: 0; }
 QComboBox:disabled, QSpinBox:disabled { color: #a0a7b2; background: #f0f2f6; }
 QComboBox QAbstractItemView {
     background: #ffffff;

@@ -39,9 +39,12 @@ class FlashOptions:
     firmware_path: str = ""
     address: str = ""
     frequency: str = "4000000"
+    connect_mode: str = "under-reset"
     chip_erase: bool = True
     verify_after_download: bool = True
     reset_after_download: bool = True
+    flash_start: int | None = None
+    flash_size: int | None = None
 
 
 class PyOcdBackend:
@@ -65,14 +68,14 @@ class PyOcdBackend:
         return self._run(args)
 
     def erase(self, options: FlashOptions, progress_callback: ProgressCallback | None = None) -> tuple[int, str]:
-        args = ["erase", *self._connection_args(options, connect_mode="under-reset"), "--chip"]
+        args = ["erase", *self._connection_args(options), "--chip"]
         return self._run_flash_command(args, options, progress_callback)
 
     def download(self, options: FlashOptions, progress_callback: ProgressCallback | None = None) -> tuple[int, str]:
         firmware = self._required_file(options.firmware_path, "固件文件")
-        args = ["load", *self._connection_args(options, connect_mode="under-reset")]
+        args = ["load", *self._connection_args(options)]
         if firmware.suffix.lower() == ".bin":
-            args.extend(["-a", self._required_bin_address(options.address)])
+            args.extend(["-a", self._validate_bin_file(firmware, options)])
         # 全片擦除是下载流程中的独立阶段；load 只做写入所需的扇区擦除。
         # pyOCD 默认会在 load 结束时复位，并在断开会话时恢复运行。
         # 两者都关闭，确保检验完成前目标始终保持停止。
@@ -85,21 +88,41 @@ class PyOcdBackend:
             return self._verify_elf(firmware, options, progress_callback)
         if firmware.suffix.lower() == ".hex":
             return self._verify_hex(firmware, options, progress_callback)
-        address = self._required_bin_address(options.address)
-        args = ["commander", *self._connection_args(options, connect_mode="under-reset"), "-c", f"compare {address} {self._quote_commander_path(firmware)}"]
+        address = self._validate_bin_file(firmware, options)
+        args = ["commander", *self._connection_args(options), "-c", f"compare {address} {self._quote_commander_path(firmware)}"]
         return self._run_compare_command(args, options, progress_callback)
 
     @staticmethod
     def _required_bin_address(value: str) -> str:
         address = value.strip().replace("_", "")
         if not address:
-            raise ValueError("BIN 文件不包含加载地址，请填写起始地址，例如 0x08000000。")
+            raise ValueError("BIN 文件不包含加载地址，请填写起始地址。")
+        if not address.lower().startswith("0x"):
+            address = f"0x{address}"
         if not re.fullmatch(r"0[xX][0-9a-fA-F]+", address):
-            raise ValueError(f"起始地址格式无效：{value}。请填写 0x 开头的十六进制地址，例如 0x08000000。")
+            raise ValueError(f"起始地址格式无效：{value}。请输入十六进制地址。")
         parsed = int(address, 16)
         if parsed < 0:
             raise ValueError(f"起始地址不能为负数：{value}")
         return f"0x{parsed:08X}"
+
+    def _validate_bin_file(self, firmware: Path, options: FlashOptions) -> str:
+        address = self._required_bin_address(options.address)
+        start = int(address, 16)
+        size = firmware.stat().st_size
+        if size <= 0:
+            raise ValueError(f"BIN 文件为空：{firmware}")
+        if options.flash_start is not None and options.flash_size is not None and options.flash_size > 0:
+            flash_start = options.flash_start
+            flash_end = flash_start + options.flash_size - 1
+            end = start + size - 1
+            if start < flash_start or end > flash_end:
+                raise ValueError(
+                    "BIN 地址超出当前芯片 Flash 范围："
+                    f"BIN 0x{start:08X}-0x{end:08X}，"
+                    f"Flash 0x{flash_start:08X}-0x{flash_end:08X}。"
+                )
+        return address
 
     def _verify_hex(self, firmware: Path, options: FlashOptions, progress_callback: ProgressCallback | None = None) -> tuple[int, str]:
         temporary_files: list[Path] = []
@@ -114,7 +137,7 @@ class PyOcdBackend:
                 temporary.close()
                 path = Path(temporary.name)
                 temporary_files.append(path)
-                args = ["commander", *self._connection_args(options, connect_mode="under-reset"), "-c", f"compare 0x{address:08X} {self._quote_commander_path(path)}"]
+                args = ["commander", *self._connection_args(options), "-c", f"compare 0x{address:08X} {self._quote_commander_path(path)}"]
 
                 def segment_progress(percent: int | None, text: str) -> None:
                     if progress_callback is None:
@@ -160,7 +183,7 @@ class PyOcdBackend:
                 temporary.close()
                 path = Path(temporary.name)
                 temporary_files.append(path)
-                args = ["commander", *self._connection_args(options, connect_mode="under-reset"), "-c", f"compare 0x{address:08X} {self._quote_commander_path(path)}"]
+                args = ["commander", *self._connection_args(options), "-c", f"compare 0x{address:08X} {self._quote_commander_path(path)}"]
 
                 def segment_progress(percent: int | None, text: str) -> None:
                     if progress_callback is None:
@@ -200,7 +223,7 @@ class PyOcdBackend:
             return self._find_flash_algorithm_in_pack(pack, target_key)
         return self._find_flash_algorithm_in_dir(pack, target_key)
 
-    def _connection_args(self, options: FlashOptions, connect_mode: str = "") -> list[str]:
+    def _connection_args(self, options: FlashOptions, connect_mode: str | None = None) -> list[str]:
         args: list[str] = []
         if options.probe_uid:
             args.extend(["--uid", options.probe_uid.strip()])
@@ -208,8 +231,11 @@ class PyOcdBackend:
             args.extend(["--target", options.target.strip()])
         if options.frequency:
             args.extend(["--frequency", options.frequency.strip()])
-        if connect_mode:
-            args.extend(["--connect", connect_mode])
+        mode = options.connect_mode.strip() if connect_mode is None else connect_mode.strip()
+        if mode:
+            if mode not in {"halt", "pre-reset", "under-reset", "attach"}:
+                raise ValueError(f"pyOCD 连接模式无效：{mode}")
+            args.extend(["--connect", mode])
         if options.pack_path:
             args.extend(["--pack", str(self._required_path(options.pack_path, "Pack 文件或目录"))])
         algorithm = Path(options.algorithm_path).expanduser()
