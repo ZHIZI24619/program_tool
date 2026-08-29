@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
+import shutil
+import sys
 import zipfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -32,6 +35,7 @@ class PackDefinition:
     name: str
     modified_ns: int = 0
     size: int = 0
+    source_path: str = ""
     chips: list[ChipDefinition] = field(default_factory=list)
 
     @property
@@ -55,13 +59,21 @@ class PackLibrary:
 
     def __init__(self, cache_path: Path | None = None) -> None:
         self.cache_path = cache_path or self.default_cache_path()
+        self.storage_path = self.default_storage_path()
         self.packs: list[PackDefinition] = []
         self.load()
+        self.migrate_to_storage()
 
     @staticmethod
     def default_cache_path() -> Path:
         base = Path(os.environ.get("APPDATA", Path.home() / ".config"))
         return base / "DAPFlashTool" / "pack_library.json"
+
+    @staticmethod
+    def default_storage_path() -> Path:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent / "packs"
+        return Path(__file__).resolve().parents[1] / "packs"
 
     def load(self) -> None:
         if not self.cache_path.is_file():
@@ -74,6 +86,7 @@ class PackLibrary:
                     name=item.get("name") or Path(item["path"]).stem,
                     modified_ns=item.get("modified_ns", 0),
                     size=item.get("size", 0),
+                    source_path=item.get("source_path", ""),
                     chips=[ChipDefinition(**chip) for chip in item.get("chips", [])],
                 )
                 for item in data.get("packs", [])
@@ -90,19 +103,31 @@ class PackLibrary:
         temporary.replace(self.cache_path)
 
     def add(self, path_value: str) -> PackDefinition:
-        path = Path(path_value).expanduser().resolve()
-        if not path.exists():
-            raise ValueError(f"Pack 文件或目录不存在：{path}")
-        record = self._parse(path)
+        source = Path(path_value).expanduser().resolve()
+        if not source.exists():
+            raise ValueError(f"Pack 文件或目录不存在：{source}")
+        managed = source if self._is_in_storage(source) else self._copy_to_storage(source)
+        record = self._parse(managed)
+        record.source_path = str(source)
         previous = next(
-            (pack for pack in self.packs if self._path_key(pack.path) == self._path_key(str(path))),
+            (
+                pack
+                for pack in self.packs
+                if self._path_key(pack.path) == self._path_key(str(managed))
+                or self._path_key(pack.source_path) == self._path_key(str(source))
+            ),
             None,
         )
         if previous:
             manual_algorithms = {chip.target: chip.manual_algorithm for chip in previous.chips if chip.manual_algorithm}
             for chip in record.chips:
                 chip.manual_algorithm = manual_algorithms.get(chip.target, "")
-        self.packs = [pack for pack in self.packs if self._path_key(pack.path) != self._path_key(str(path))]
+        self.packs = [
+            pack
+            for pack in self.packs
+            if self._path_key(pack.path) != self._path_key(str(managed))
+            and self._path_key(pack.source_path) != self._path_key(str(source))
+        ]
         self.packs.append(record)
         self.packs.sort(key=lambda pack: pack.name.lower())
         self.save()
@@ -110,8 +135,27 @@ class PackLibrary:
 
     def remove(self, path_value: str) -> None:
         key = self._path_key(path_value)
+        removed = [pack for pack in self.packs if self._path_key(pack.path) == key]
         self.packs = [pack for pack in self.packs if self._path_key(pack.path) != key]
+        for pack in removed:
+            self._delete_managed_copy(Path(pack.path))
         self.save()
+
+    def migrate_to_storage(self) -> None:
+        changed = False
+        for pack in self.packs:
+            current = Path(pack.path).expanduser()
+            if self._is_in_storage(current) or not current.exists():
+                continue
+            managed = self._copy_to_storage(current)
+            pack.source_path = pack.source_path or str(current)
+            pack.path = str(managed)
+            stat = managed.stat()
+            pack.modified_ns = stat.st_mtime_ns
+            pack.size = stat.st_size if managed.is_file() else 0
+            changed = True
+        if changed:
+            self.save()
 
     def set_manual_algorithm(self, pack_path: str, target: str, algorithm_path: str) -> None:
         for pack in self.packs:
@@ -207,8 +251,49 @@ class PackLibrary:
 
     @staticmethod
     def _path_key(value: str) -> str:
+        if not value:
+            return ""
         return os.path.normcase(os.path.abspath(value))
 
     @staticmethod
     def _local_name(tag: str) -> str:
         return tag.rsplit("}", 1)[-1]
+
+    def _copy_to_storage(self, source: Path) -> Path:
+        storage = self.storage_path
+        storage.mkdir(parents=True, exist_ok=True)
+        target = storage / self._managed_name(source)
+        if source.is_dir():
+            if target.exists():
+                self._delete_managed_copy(target)
+            shutil.copytree(source, target)
+        else:
+            if target.exists() and target.is_dir():
+                self._delete_managed_copy(target)
+            shutil.copy2(source, target)
+        return target
+
+    def _managed_name(self, source: Path) -> str:
+        digest = hashlib.sha256(str(source).encode("utf-8")).hexdigest()[:12]
+        if source.is_dir():
+            return f"{source.name}_{digest}"
+        return f"{source.stem}_{digest}{source.suffix}"
+
+    def _is_in_storage(self, path: Path) -> bool:
+        try:
+            path.resolve().relative_to(self.storage_path.resolve())
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def _delete_managed_copy(self, path: Path) -> None:
+        try:
+            resolved = path.resolve()
+            storage = self.storage_path.resolve()
+            resolved.relative_to(storage)
+            if resolved.is_dir():
+                shutil.rmtree(resolved)
+            else:
+                resolved.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass

@@ -594,7 +594,7 @@ class DapFlashApp(QWidget):
             try:
                 record = self.pack_library.add(path)
                 added += 1
-                self._append_log(f"已缓存 Pack：{record.name}，{len(record.chips)} 个芯片。")
+                self._append_log(f"已复制并缓存 Pack：{record.name}，{len(record.chips)} 个芯片。\n{record.path}")
             except Exception as exc:
                 errors.append(f"{path}\n{exc}")
         self._load_pack_library()
