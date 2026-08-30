@@ -754,6 +754,7 @@ class DapFlashApp(QWidget):
         dialog.resize(760, 420)
         lay = QVBoxLayout(dialog)
         table = self._make_table(["芯片包", "芯片数", "文件路径"])
+        self._configure_pack_table(table)
         lay.addWidget(table)
 
         def populate() -> None:
@@ -761,9 +762,10 @@ class DapFlashApp(QWidget):
             for row, pack in enumerate(self.pack_library.packs):
                 table.setItem(row, 0, self._item(pack.name, pack))
                 table.setItem(row, 1, self._item(str(len(pack.chips))))
-                table.setItem(row, 2, self._item(pack.path))
-            table.resizeColumnsToContents()
-            table.horizontalHeader().setStretchLastSection(True)
+                path_item = self._item(pack.path)
+                path_item.setToolTip(pack.path)
+                table.setItem(row, 2, path_item)
+            self._configure_pack_table(table)
 
         def add_pack() -> None:
             self.select_pack()
@@ -1393,6 +1395,17 @@ class DapFlashApp(QWidget):
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         table.horizontalHeader().setStretchLastSection(True)
         return table
+
+    @staticmethod
+    def _configure_pack_table(table: QTableWidget) -> None:
+        header = table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(70)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        table.setColumnWidth(0, 150)
+        table.setColumnWidth(1, 80)
 
     @staticmethod
     def _configure_filter_combo(combo: QComboBox) -> None:
