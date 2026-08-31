@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
-import hashlib
 import subprocess
 import sys
 import tempfile
@@ -10,6 +10,7 @@ import threading
 import time
 import zipfile
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Callable, Iterable
@@ -43,11 +44,11 @@ class FlashOptions:
     address: str = ""
     frequency: str = "4000000"
     connect_mode: str = "under-reset"
+    algorithm_ram_start: str = "0x20000000"
+    algorithm_ram_size: str = "0x1000"
     chip_erase: bool = True
     verify_after_download: bool = True
     reset_after_download: bool = True
-    flash_start: int | None = None
-    flash_size: int | None = None
 
 
 class PyOcdBackend:
@@ -87,7 +88,13 @@ class PyOcdBackend:
             probe_error = self._probe_error(options)
             if probe_error:
                 return probe_error
-        args = ["erase", *self._connection_args(options), "--chip"]
+        args = ["erase", *self._connection_args(options)]
+        algorithm = Path(options.algorithm_path).expanduser()
+        if algorithm.is_file() and algorithm.suffix.lower() == ".flm":
+            start, end_exclusive = self._manual_algorithm_flash_range(algorithm)
+            args.extend(["--sector", f"0x{start:08X}-0x{end_exclusive:08X}"])
+        else:
+            args.append("--chip")
         return self._run_flash_command(args, options, progress_callback)
 
     def download(self, options: FlashOptions, progress_callback: ProgressCallback | None = None, check_probe: bool = True) -> tuple[int, str]:
@@ -135,20 +142,9 @@ class PyOcdBackend:
 
     def _validate_bin_file(self, firmware: Path, options: FlashOptions) -> str:
         address = self._required_bin_address(options.address)
-        start = int(address, 16)
         size = firmware.stat().st_size
         if size <= 0:
             raise ValueError(f"BIN 文件为空：{firmware}")
-        if options.flash_start is not None and options.flash_size is not None and options.flash_size > 0:
-            flash_start = options.flash_start
-            flash_end = flash_start + options.flash_size - 1
-            end = start + size - 1
-            if start < flash_start or end > flash_end:
-                raise ValueError(
-                    "BIN 地址超出当前芯片 Flash 范围："
-                    f"BIN 0x{start:08X}-0x{end:08X}，"
-                    f"Flash 0x{flash_start:08X}-0x{flash_end:08X}。"
-                )
         return address
 
     def _verify_hex(self, firmware: Path, options: FlashOptions, progress_callback: ProgressCallback | None = None) -> tuple[int, str]:
@@ -275,7 +271,18 @@ class PyOcdBackend:
             args.extend(["--pack", str(self._required_path(options.pack_path, "Pack 文件或目录"))])
         algorithm = Path(options.algorithm_path).expanduser()
         if algorithm.is_file() and algorithm.suffix.lower() == ".flm":
-            args.extend(["--script", str(self._manual_algorithm_script(algorithm))])
+            ram_start = self._parse_int_option(options.algorithm_ram_start, "算法 RAM 起始地址")
+            ram_size = self._parse_int_option(options.algorithm_ram_size, "算法 RAM 大小")
+            if ram_start < 0:
+                raise ValueError("算法 RAM 起始地址不能为负数。")
+            if ram_size <= 0:
+                raise ValueError("算法 RAM 大小必须大于 0。")
+            args.extend(
+                [
+                    "--script",
+                    str(self._manual_algorithm_script(algorithm, ram_start, ram_size)),
+                ]
+            )
         return args
 
     def _run_flash_command(
@@ -368,28 +375,124 @@ class PyOcdBackend:
         return code, output
 
     @staticmethod
-    def _manual_algorithm_script(algorithm: Path) -> Path:
+    def _manual_algorithm_script(
+        algorithm: Path,
+        ram_start: int = 0x20000000,
+        ram_size: int = 0x1000,
+    ) -> Path:
         algorithm = algorithm.resolve()
-        digest = hashlib.sha256(str(algorithm).encode("utf-8")).hexdigest()[:16]
+        key = f"{algorithm}|0x{ram_start:08X}|0x{ram_size:X}"
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
         script_dir = Path(tempfile.gettempdir()) / "DAPFlashTool"
         script_dir.mkdir(parents=True, exist_ok=True)
         script = script_dir / f"flm_override_{digest}.py"
         source = (
             "import logging\n"
-            "from pyocd.core.memory_map import MemoryType\n\n"
-            f"FLM_PATH = {str(algorithm)!r}\n\n"
+            "import traceback\n"
+            "from pyocd.coresight.ap import APv1Address\n"
+            "from pyocd.core.memory_map import FlashRegion, MemoryType\n"
+            "from pyocd.target.pack.flash_algo import PackFlashAlgo\n\n"
+            f"FLM_PATH = {str(algorithm)!r}\n"
+            f"ALGO_RAM_START = 0x{ram_start:08X}\n"
+            f"ALGO_RAM_SIZE = 0x{ram_size:X}\n\n"
             "LOG = logging.getLogger(__name__)\n\n"
+            "def _fix_single_core_pack_topology(target):\n"
+            "    pack_device = getattr(target, '_pack_device', None)\n"
+            "    if pack_device is None:\n"
+            "        return\n"
+            "    processors = list(pack_device.processors_map.values())\n"
+            "    if len(processors) != 1:\n"
+            "        return\n"
+            "    processor = processors[0]\n"
+            "    if processor.ap_address.nominal_address >= 0:\n"
+            "        return\n"
+            "    processor.ap_address = APv1Address(0)\n"
+            "    pack_device._processors_ap_map = {}\n"
+            "    LOG.info('Mapped legacy single-core Pack processor %s to AP#0', processor.name)\n\n"
             "def will_connect(board):\n"
-            "    regions = list(board.target.memory_map.iter_matching_regions(type=MemoryType.FLASH))\n"
-            "    if not regions:\n"
-            "        raise RuntimeError('目标没有可应用手动 FLM 的 Flash 区域')\n"
-            "    region = next((item for item in regions if item.is_boot_memory), regions[0])\n"
-            "    region.flm = FLM_PATH\n"
-            "    LOG.info('使用手动 Flash 算法：%s', FLM_PATH)\n"
+            "    try:\n"
+            "        _fix_single_core_pack_topology(board.target)\n"
+            "        memory_map = board.target.memory_map\n"
+            "        pack_algo = PackFlashAlgo(FLM_PATH)\n"
+            "        start = int(pack_algo.flash_start)\n"
+            "        length = int(pack_algo.flash_size)\n"
+            "        if length <= 0:\n"
+            "            raise RuntimeError('Manual FLM reports an invalid flash size')\n"
+            "        end = start + length - 1\n"
+            "        regions = list(memory_map.iter_matching_regions(type=MemoryType.FLASH))\n"
+            "        for region in regions:\n"
+            "            if region.intersects_range(start=start, end=end):\n"
+            "                memory_map.remove_region(region)\n"
+            "        region = FlashRegion(\n"
+            "            name='ManualFLM',\n"
+            "            start=start,\n"
+            "            length=length,\n"
+            "            flm=FLM_PATH,\n"
+            "            sector_size=0,\n"
+            "            is_boot_memory=True,\n"
+            "            is_default=True,\n"
+            "        )\n"
+            "        region._RAMstart = ALGO_RAM_START\n"
+            "        region._RAMsize = ALGO_RAM_SIZE\n"
+            "        memory_map.add_region(region)\n"
+            "        LOG.info(\n"
+            "            'Manual FLM region: 0x%08X-0x%08X, RAM start=%s size=%s, %s',\n"
+            "            start, end, ALGO_RAM_START, ALGO_RAM_SIZE, FLM_PATH,\n"
+            "        )\n"
+            "    except Exception:\n"
+            "        traceback.print_exc()\n"
+            "        raise\n"
         )
         if not script.is_file() or script.read_text(encoding="utf-8") != source:
             script.write_text(source, encoding="utf-8")
         return script
+
+    @staticmethod
+    def _manual_algorithm_flash_range(algorithm: Path) -> tuple[int, int]:
+        start, size = PyOcdBackend.flash_algorithm_range(str(algorithm))
+        return start, start + size
+
+    @staticmethod
+    def flash_algorithm_range(algorithm_path: str, pack_path: str = "") -> tuple[int, int]:
+        """Read the Flash start and size from a standalone or packed FLM file."""
+        from pyocd.target.pack.flash_algo import PackFlashAlgo
+
+        text = algorithm_path.strip()
+        if not text:
+            raise ValueError("Flash 算法文件不能为空。")
+
+        algorithm = Path(text).expanduser()
+        if algorithm.is_file() and algorithm.suffix.lower() == ".flm":
+            pack_algorithm = PackFlashAlgo(str(algorithm))
+        elif "::" in text and pack_path:
+            member = text.split("::", 1)[1].strip().replace("\\", "/").lstrip("./")
+            pack = Path(pack_path).expanduser()
+            if not pack.is_file() or not zipfile.is_zipfile(pack):
+                raise ValueError(f"无法读取算法所在的芯片包：{pack}")
+            with zipfile.ZipFile(pack) as archive:
+                members = {name.replace("\\", "/").lower(): name for name in archive.namelist()}
+                archive_name = members.get(member.lower())
+                if archive_name is None:
+                    raise ValueError(f"芯片包中没有找到 FLM：{member}")
+                pack_algorithm = PackFlashAlgo(BytesIO(archive.read(archive_name)))
+        else:
+            raise ValueError(f"Flash 算法文件不存在或格式不受支持：{text}")
+
+        start = int(pack_algorithm.flash_start)
+        size = int(pack_algorithm.flash_size)
+        if size <= 0:
+            raise ValueError(f"FLM 声明的 Flash 大小无效：0x{size:X}")
+        return start, size
+
+    @staticmethod
+    def _parse_int_option(value: str, label: str) -> int:
+        text = value.strip().replace("_", "")
+        if not text:
+            raise ValueError(f"{label}不能为空。")
+        try:
+            return int(text, 0)
+        except ValueError as exc:
+            raise ValueError(f"{label}格式错误：{value}") from exc
 
     def _run(
         self,

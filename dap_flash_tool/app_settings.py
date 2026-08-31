@@ -16,6 +16,8 @@ class AppSettings:
     address: str = ""
     frequency: str = "10MHz"
     connect_mode: str = "under-reset"
+    algorithm_ram_start: str = "0x20000000"
+    algorithm_ram_size: str = "0x1000"
     chip_erase: bool = False
     verify: bool = True
     reset_after_download: bool = True

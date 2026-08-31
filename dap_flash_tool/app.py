@@ -186,6 +186,8 @@ class DapFlashApp(QWidget):
         self.settings_store = AppSettingsStore()
         self.saved_settings = self.settings_store.load()
         self.selected_chip: tuple[PackDefinition, ChipDefinition] | None = None
+        self.algorithm_flash_start: int | None = None
+        self.algorithm_flash_size: int | None = None
         self.pack_targets: list[str] = []
         self.action_buttons: list[QPushButton] = []
         self._dark_mode = bool(self.saved_settings.dark_mode)
@@ -379,7 +381,8 @@ class DapFlashApp(QWidget):
         target_lay.addWidget(self.connect_mode_combo, 2, 1, 1, 2)
         self.flash_info_label = QLabel("未知")
         self.flash_info_label.setObjectName("hintLabel")
-        target_lay.addWidget(QLabel("Flash 范围："), 3, 0, Qt.AlignRight)
+        self.flash_info_label.setToolTip("从当前 FLM 的 FlashDevice 信息读取")
+        target_lay.addWidget(QLabel("FLM Flash："), 3, 0, Qt.AlignRight)
         target_lay.addWidget(self.flash_info_label, 3, 1, 1, 2)
         self.address_edit = QLineEdit()
         self.address_edit.setValidator(QRegularExpressionValidator(QRegularExpression("[0-9A-Fa-f_]*"), self.address_edit))
@@ -401,6 +404,7 @@ class DapFlashApp(QWidget):
         files_lay.setHorizontalSpacing(8)
         files_lay.setVerticalSpacing(6)
         self.algorithm_edit = QLineEdit()
+        self.algorithm_edit.editingFinished.connect(lambda: self._refresh_algorithm_flash_info(log_errors=True))
         btn_algorithm = QPushButton("浏览")
         btn_algorithm.clicked.connect(self.select_algorithm)
         files_lay.addWidget(QLabel("Flash 算法："), 0, 0, Qt.AlignRight)
@@ -412,6 +416,26 @@ class DapFlashApp(QWidget):
         files_lay.addWidget(QLabel("固件文件："), 1, 0, Qt.AlignRight)
         files_lay.addWidget(self.firmware_edit, 1, 1)
         files_lay.addWidget(btn_firmware, 1, 2)
+        self.algorithm_ram_start_edit = QLineEdit()
+        self.algorithm_ram_start_edit.setValidator(
+            QRegularExpressionValidator(QRegularExpression("(?:0[xX])?[0-9A-Fa-f_]*"), self.algorithm_ram_start_edit)
+        )
+        self.algorithm_ram_start_edit.setToolTip("手动 FLM 运行时使用的 RAM 起始地址")
+        self.algorithm_ram_size_edit = QLineEdit()
+        self.algorithm_ram_size_edit.setValidator(
+            QRegularExpressionValidator(QRegularExpression("(?:0[xX])?[0-9A-Fa-f_]*"), self.algorithm_ram_size_edit)
+        )
+        self.algorithm_ram_size_edit.setToolTip("手动 FLM 运行时可使用的 RAM 大小")
+        ram_box = QWidget()
+        ram_lay = QHBoxLayout(ram_box)
+        ram_lay.setContentsMargins(0, 0, 0, 0)
+        ram_lay.setSpacing(6)
+        ram_lay.addWidget(QLabel("Start"))
+        ram_lay.addWidget(self.algorithm_ram_start_edit, 1)
+        ram_lay.addWidget(QLabel("Size"))
+        ram_lay.addWidget(self.algorithm_ram_size_edit, 1)
+        files_lay.addWidget(QLabel("算法 RAM："), 2, 0, Qt.AlignRight)
+        files_lay.addWidget(ram_box, 2, 1, 1, 2)
         lay.addWidget(files)
 
         options = QGroupBox("下载选项")
@@ -473,10 +497,13 @@ class DapFlashApp(QWidget):
         self.connect_mode_combo.setCurrentText(s.connect_mode or "under-reset")
         self._set_address_text(s.address)
         self.algorithm_edit.setText(s.algorithm_path)
+        self.algorithm_ram_start_edit.setText(s.algorithm_ram_start or "0x20000000")
+        self.algorithm_ram_size_edit.setText(s.algorithm_ram_size or "0x1000")
         self.firmware_edit.setText(s.firmware_path)
         self.chip_erase_check.setChecked(s.chip_erase)
         self.verify_check.setChecked(s.verify)
         self.reset_check.setChecked(s.reset_after_download)
+        self._refresh_algorithm_flash_info(log_errors=False)
 
     def _current_settings(self) -> AppSettings:
         return AppSettings(
@@ -488,6 +515,8 @@ class DapFlashApp(QWidget):
             address=self._address_text(),
             frequency=self.frequency_combo.currentText().strip(),
             connect_mode=self.connect_mode_combo.currentText().strip(),
+            algorithm_ram_start=self.algorithm_ram_start_edit.text().strip(),
+            algorithm_ram_size=self.algorithm_ram_size_edit.text().strip(),
             chip_erase=self.chip_erase_check.isChecked(),
             verify=self.verify_check.isChecked(),
             reset_after_download=self.reset_check.isChecked(),
@@ -639,11 +668,11 @@ class DapFlashApp(QWidget):
             address=self._address_text(),
             frequency=self.frequency_combo.currentText().strip(),
             connect_mode=self.connect_mode_combo.currentText().strip(),
+            algorithm_ram_start=self.algorithm_ram_start_edit.text().strip(),
+            algorithm_ram_size=self.algorithm_ram_size_edit.text().strip(),
             chip_erase=self.chip_erase_check.isChecked(),
             verify_after_download=self.verify_check.isChecked(),
             reset_after_download=self.reset_check.isChecked(),
-            flash_start=self.selected_chip[1].flash_start if self.selected_chip else None,
-            flash_size=self.selected_chip[1].flash_size if self.selected_chip else None,
         )
 
     def _require_probe_for_action(self, action: str) -> bool:
@@ -783,7 +812,7 @@ class DapFlashApp(QWidget):
                 self.selected_chip = None
                 self.target_edit.clear()
                 self.algorithm_edit.clear()
-                self._update_flash_info(None)
+                self._refresh_algorithm_flash_info()
             self._load_pack_library()
             self._append_log(f"已从缓存库移除 Pack：{pack.name}。")
             populate()
@@ -934,10 +963,9 @@ class DapFlashApp(QWidget):
     def _select_chip(self, pack: PackDefinition, chip: ChipDefinition, log: bool = True) -> None:
         self.selected_chip = (pack, chip)
         self.target_edit.setText(chip.target)
-        self._update_flash_info(chip)
-        if self.firmware_edit.text().strip().lower().endswith(".bin") and not self.address_edit.text().strip() and chip.flash_start is not None:
-            self._set_address_text(f"0x{chip.flash_start:08X}")
         self.auto_detect_flash_algorithm()
+        if self.firmware_edit.text().strip().lower().endswith(".bin") and not self.address_edit.text().strip() and self.algorithm_flash_start is not None:
+            self._set_address_text(f"0x{self.algorithm_flash_start:08X}")
         if log:
             self._append_log(f"已选择芯片：{chip.vendor} / {chip.series} / {chip.target}（{pack.name}）")
 
@@ -963,6 +991,9 @@ class DapFlashApp(QWidget):
             self._append_log(f"已为 {chip.target} 保存手动算法：{algorithm_path}")
         else:
             self._append_log(f"已归档算法文件；选择缓存库中的芯片后才能保存芯片映射。\n{algorithm_path}")
+        self._refresh_algorithm_flash_info(log_errors=True)
+        if self.firmware_edit.text().strip().lower().endswith(".bin") and not self.address_edit.text().strip() and self.algorithm_flash_start is not None:
+            self._set_address_text(f"0x{self.algorithm_flash_start:08X}")
 
     def select_firmware(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(self, "选择固件", "", "Firmware (*.hex *.bin *.elf *.axf);;所有文件 (*)")
@@ -971,8 +1002,8 @@ class DapFlashApp(QWidget):
         self.firmware_edit.setText(selected)
         if Path(selected).suffix.lower() in {".hex", ".elf", ".axf"}:
             self._set_address_text("")
-        elif not self.address_edit.text().strip() and self.selected_chip and self.selected_chip[1].flash_start is not None:
-            self._set_address_text(f"0x{self.selected_chip[1].flash_start:08X}")
+        elif not self.address_edit.text().strip() and self.algorithm_flash_start is not None:
+            self._set_address_text(f"0x{self.algorithm_flash_start:08X}")
         self.analyze_firmware()
 
     def analyze_firmware(self) -> None:
@@ -996,6 +1027,7 @@ class DapFlashApp(QWidget):
         else:
             self.algorithm_edit.clear()
             self._append_log(f"{chip.target} 没有匹配到 Flash 算法，请手动添加 FLM 文件。")
+        self._refresh_algorithm_flash_info(log_errors=False)
 
     # ------------------------------------------------------------- updater
     def _check_update_on_startup(self) -> None:
@@ -1361,8 +1393,29 @@ class DapFlashApp(QWidget):
             text = text[2:]
         self.address_edit.setText(text.upper())
 
-    def _update_flash_info(self, chip: ChipDefinition | None) -> None:
-        self.flash_info_label.setText(chip.flash_display if chip else "未知")
+    def _refresh_algorithm_flash_info(self, log_errors: bool = False) -> None:
+        self.algorithm_flash_start = None
+        self.algorithm_flash_size = None
+        algorithm = self.algorithm_edit.text().strip()
+        if not algorithm:
+            self.flash_info_label.setText("未知")
+            return
+        pack_path = self._selected_pack_path() or self.saved_settings.pack_path
+        try:
+            start, size = self.backend.flash_algorithm_range(algorithm, pack_path)
+        except Exception as exc:
+            self.flash_info_label.setText("无法读取")
+            self.flash_info_label.setToolTip(str(exc))
+            if log_errors:
+                self._append_log(f"FLM 信息读取失败：{exc}")
+            return
+        self.algorithm_flash_start = start
+        self.algorithm_flash_size = size
+        end = start + size - 1
+        size_k = size / 1024
+        size_text = str(int(size_k)) if size_k.is_integer() else f"{size_k:.1f}".rstrip("0").rstrip(".")
+        self.flash_info_label.setText(f"0x{start:08X}-0x{end:08X} ({size_text}K)")
+        self.flash_info_label.setToolTip("从当前 FLM 的 FlashDevice 信息读取")
 
     @staticmethod
     def _set_combo_text(combo: QComboBox, text: str) -> None:

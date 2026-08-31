@@ -8,6 +8,7 @@ build/
 dist/
 installer/
 packs/
+algorithms/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
